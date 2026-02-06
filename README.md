@@ -1,14 +1,14 @@
 # ABRAXAS
 
-A single-binary C23 daemon that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location. No cron jobs, no geoclue, no shared libraries to install.
+A single-binary C23 daemon that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location. ABRAXAS allows for USA-specific builds (alongside manual calls for international users) which utilize NOAA data to further assist in screen temperature shifts during non-ideal weather.
 
 **Key Features:**
 
 ### Solar Grayline Engine
-- **NOAA Ephemeris**: Offline sunrise/sunset from Jean Meeus algorithms -- pure trig, no network call
+- **Worldwide Usage**: Offline sunrise/sunset from Jean Meeus algorithms -- pure trig, no network call, any latitude/longitude
 - **Sigmoid Transitions**: Normalized sigmoid over 90-min dawn and 120-min dusk windows, imperceptible at both ends
 - **Endpoint Normalization**: Exact [0, 1] output over [-1, 1] domain -- no residual drift at target temperatures
-- **Weather Awareness**: NOAA api.weather.gov cloud cover shifts daytime target (6500K clear, 4500K overcast)
+- **Weather Awareness (US, optional)**: NOAA api.weather.gov cloud cover shifts daytime target (6500K clear, 4500K overcast). See [Build & Install](#build--install) for international builds
 - **Manual Override**: `--set TEMP MINUTES` with the same sigmoid curve, auto-resumes at next transition window
 
 ### libmeridian (Gamma Control)
