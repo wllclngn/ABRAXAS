@@ -14,9 +14,11 @@
 #include "solar.h"
 #include "weather.h"
 
+#include <curl/curl.h>
 #include <meridian.h>
 
 #include <errno.h>
+#include <stdlib.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -143,13 +145,29 @@ void daemon_run(daemon_state_t *state)
     printf("Temperature update: every %ds\n", TEMP_UPDATE_SEC);
     printf("Using kernel timerfd + inotify + signalfd\n\n");
 
-    if (!gamma_init()) {
-        fprintf(stderr, "[fatal] No gamma backend available\n");
-        return;
+    /* Retry gamma init -- display server may not be ready at boot.
+     * Poll every 500ms for up to 30s to catch X11/Wayland readiness fast. */
+    for (int attempt = 0; attempt < 60; attempt++) {
+        if (gamma_init()) break;
+        if (attempt == 59) {
+            fprintf(stderr, "[fatal] No gamma backend after 30s\n");
+            exit(1);
+        }
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000000 };
+        nanosleep(&ts, nullptr);
     }
 
     /* Load cached data */
     state->weather = config_load_weather_cache(&state->paths);
+
+    /* Apply correct temperature immediately at startup */
+    int startup_temp = solar_temperature(time(nullptr),
+        state->location.lat, state->location.lon, &state->weather);
+    gamma_set(startup_temp);
+    printf("[startup] Applied %dK\n", startup_temp);
+
+    /* Init curl now -- after gamma is applied, before event loop needs weather */
+    curl_global_init(CURL_GLOBAL_DEFAULT);
 
     bool running = true;
 
@@ -175,26 +193,34 @@ void daemon_run(daemon_state_t *state)
     /* Recover from active override on restart */
     override_state_t ovr = config_load_override(&state->paths);
     if (ovr.active) {
-        state->manual_mode = true;
-        state->manual_target_temp = ovr.target_temp;
-        state->manual_duration_min = ovr.duration_minutes;
-        state->manual_issued_at = ovr.issued_at;
-        state->manual_start_time = ovr.issued_at;
-        state->manual_start_temp = ovr.start_temp;
-        if (state->manual_start_temp == 0) {
-            state->manual_start_temp = solar_temperature(time(nullptr),
-                state->location.lat, state->location.lon, &state->weather);
-            ovr.start_temp = state->manual_start_temp;
-            config_save_override(&state->paths, &ovr);
-        }
-        state->manual_resume_time = next_transition_resume(time(nullptr),
-            state->location.lat, state->location.lon);
-        printf("[manual] Recovered override: -> %dK (%d min)\n",
-               state->manual_target_temp, state->manual_duration_min);
+        double elapsed = difftime(time(nullptr), ovr.issued_at) / 60.0;
+        if (elapsed >= (double)ovr.duration_minutes) {
+            /* Override already completed before restart -- discard it */
+            config_clear_override(&state->paths);
+            printf("[manual] Cleared stale override (completed %.0f min ago)\n",
+                   elapsed - (double)ovr.duration_minutes);
+        } else {
+            state->manual_mode = true;
+            state->manual_target_temp = ovr.target_temp;
+            state->manual_duration_min = ovr.duration_minutes;
+            state->manual_issued_at = ovr.issued_at;
+            state->manual_start_time = ovr.issued_at;
+            state->manual_start_temp = ovr.start_temp;
+            if (state->manual_start_temp == 0) {
+                state->manual_start_temp = solar_temperature(time(nullptr),
+                    state->location.lat, state->location.lon, &state->weather);
+                ovr.start_temp = state->manual_start_temp;
+                config_save_override(&state->paths, &ovr);
+            }
+            state->manual_resume_time = next_transition_resume(time(nullptr),
+                state->location.lat, state->location.lon);
+            printf("[manual] Recovered override: -> %dK (%d min)\n",
+                   state->manual_target_temp, state->manual_duration_min);
 
-        struct tm rt;
-        localtime_r(&state->manual_resume_time, &rt);
-        printf("[manual] Auto-resume at: %02d:%02d\n", rt.tm_hour, rt.tm_min);
+            struct tm rt;
+            localtime_r(&state->manual_resume_time, &rt);
+            printf("[manual] Auto-resume at: %02d:%02d\n", rt.tm_hour, rt.tm_min);
+        }
     }
 
     /* Event loop */
@@ -387,6 +413,7 @@ void daemon_run(daemon_state_t *state)
 
     /* Clean shutdown */
     printf("Shutting down...\n");
+    curl_global_cleanup();
     gamma_restore();
     gamma_cleanup();
 

@@ -251,12 +251,9 @@ static struct option long_opts[] = {
 
 int main(int argc, char **argv)
 {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-
     abraxas_paths_t paths;
     if (!config_init_paths(&paths)) {
         fprintf(stderr, "Failed to initialize paths (is $HOME set?)\n");
-        curl_global_cleanup();
         return 1;
     }
 
@@ -282,27 +279,18 @@ int main(int argc, char **argv)
             break;
         case 'R': command = CMD_RESUME;   break;
         case 'x': command = CMD_RESET;    break;
-        case 'h': usage(); curl_global_cleanup(); return 0;
-        default:  usage(); curl_global_cleanup(); return 1;
+        case 'h': usage(); return 0;
+        default:  usage(); return 1;
         }
     }
 
     /* Commands that don't need location */
-    if (command == CMD_RESET) {
-        int r = cmd_reset(&paths);
-        curl_global_cleanup();
-        return r;
-    }
-    if (command == CMD_RESUME) {
-        int r = cmd_resume(&paths);
-        curl_global_cleanup();
-        return r;
-    }
-    if (command == CMD_SET_LOC) {
-        int r = cmd_set_location(loc_arg, &paths);
-        curl_global_cleanup();
-        return r;
-    }
+    if (command == CMD_RESET)
+        return cmd_reset(&paths);
+    if (command == CMD_RESUME)
+        return cmd_resume(&paths);
+    if (command == CMD_SET_LOC)
+        return cmd_set_location(loc_arg, &paths);
 
     /* Remaining commands need location */
     location_t loc = config_load_location(&paths);
@@ -310,7 +298,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "No location configured. Use --set-location first.\n");
         fprintf(stderr, "  Example: abraxas --set-location 60614\n");
         fprintf(stderr, "  Example: abraxas --set-location 41.88,-87.63\n");
-        curl_global_cleanup();
         return 1;
     }
 
@@ -320,6 +307,7 @@ int main(int argc, char **argv)
         cmd_status(loc.lat, loc.lon, &paths);
         break;
     case CMD_REFRESH:
+        curl_global_init(CURL_GLOBAL_DEFAULT);
         result = cmd_refresh(loc.lat, loc.lon, &paths);
         break;
     case CMD_SET_TEMP:

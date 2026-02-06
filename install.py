@@ -224,6 +224,9 @@ def cmd_install(args, source_dir: Path) -> bool:
     INSTALL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     INSTALL_SERVICE.parent.mkdir(parents=True, exist_ok=True)
 
+    # Stop service before overwriting running binary
+    subprocess.run(["systemctl", "--user", "stop", "abraxas"], capture_output=True)
+
     # Copy binary
     log_info(f"Installing {INSTALL_BINARY}...")
     shutil.copy2(source_binary, INSTALL_BINARY)

@@ -18,6 +18,7 @@ A single-binary C23 daemon that smoothly adjusts your screen's color temperature
 - **Blackbody Ramp**: Planckian locus approximation, 1000K-25000K
 
 ### Kernel Event Loop
+- **Instant Startup**: Gamma applied before curl/SSL init -- screen is correct on first frame
 - **timerfd**: 60-second update ticks (no `sleep()` drift)
 - **inotify**: Config file hot-reload, override detection
 - **signalfd**: Clean SIGTERM/SIGINT shutdown via `select()`
@@ -155,7 +156,7 @@ No runtime dependencies beyond libc, libm, and libcurl. All backends are optiona
 ### Build & Install
 
 ```bash
-# Automated installer (builds everything, copies binary, enables service)
+# Automated installer (builds, copies binary + ZIP db, installs service)
 ./install.py
 
 # Or manually:
@@ -163,9 +164,6 @@ make
 mkdir -p ~/.local/bin ~/.config/abraxas
 cp abraxas ~/.local/bin/
 cp us_zipcodes.bin ~/.config/abraxas/
-cp abraxas.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now abraxas.service
 ```
 
 ### Setup
@@ -179,14 +177,31 @@ abraxas --set-location 41.88,-87.63
 abraxas --status
 ```
 
+### Autostart
+
+**Window managers (awesome, i3, sway, etc.):** Launch from your WM config. This guarantees the display server is ready -- gamma applies instantly on login.
+
+```lua
+-- awesome: rc.lua
+awful.spawn("/home/USER/.local/bin/abraxas --daemon")
+```
+```bash
+# i3/sway: config
+exec --no-startup-id ~/.local/bin/abraxas --daemon
+```
+
+**Desktop environments (GNOME, KDE):** The systemd service works if your DE activates `graphical-session.target`:
+
+```bash
+cp abraxas.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now abraxas.service
+```
+
 ### Migrating from redshift
 
 ```bash
-# Disable redshift
 systemctl --user disable --now redshift.service redshift-scheduler.service 2>/dev/null
-
-# Enable ABRAXAS
-systemctl --user enable --now abraxas.service
 ```
 
 No config migration needed. ABRAXAS calculates everything from your location.
