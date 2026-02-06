@@ -297,6 +297,12 @@ meridian_fill_gamma_ramps(int temp, int gamma_size,
                           uint16_t *restrict r, uint16_t *restrict g, uint16_t *restrict b,
                           float brightness)
 {
+    if (gamma_size < 2) return MERIDIAN_ERR_INVALID_TEMP;
+
+    /* Clamp brightness to valid range */
+    if (brightness < 0.0f) brightness = 0.0f;
+    if (brightness > 1.0f) brightness = 1.0f;
+
     meridian_rgb_t rgb;
     meridian_error_t err = meridian_temp_to_rgb(temp, &rgb);
     if (err != MERIDIAN_OK) return err;

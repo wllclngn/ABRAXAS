@@ -11,8 +11,37 @@
 
 #include "meridian.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+/* ============================================================
+ * Error handling (shared by all backends)
+ * ============================================================ */
+
+static const char *error_messages[] = {
+    [0] = "Success",
+    [-MERIDIAN_ERR_INVALID_TEMP] = "Invalid temperature",
+    [-MERIDIAN_ERR_OPEN] = "Failed to open display device",
+    [-MERIDIAN_ERR_RESOURCES] = "Failed to get display resources",
+    [-MERIDIAN_ERR_CRTC] = "Failed to get CRTC info",
+    [-MERIDIAN_ERR_GAMMA] = "Failed to set gamma ramp",
+    [-MERIDIAN_ERR_NO_CRTC] = "No usable CRTC found",
+    [-MERIDIAN_ERR_PERMISSION] = "Permission denied (need video group?)",
+    [-MERIDIAN_ERR_WAYLAND_CONNECT] = "Failed to connect to Wayland display",
+    [-MERIDIAN_ERR_WAYLAND_PROTOCOL] = "Wayland compositor lacks gamma control protocol",
+    [-MERIDIAN_ERR_GNOME_DBUS] = "Failed to communicate with Mutter via DBus",
+};
+
+const char *
+meridian_strerror(meridian_error_t err)
+{
+    int idx = -err;
+    if (idx >= 0 && idx < (int)(sizeof(error_messages) / sizeof(error_messages[0]))) {
+        return error_messages[idx] ? error_messages[idx] : "Unknown error";
+    }
+    return "Unknown error";
+}
 
 /* Backend type */
 typedef enum {
@@ -50,7 +79,7 @@ meridian_error_t
 meridian_init_card(int card_num, meridian_state_t **state_out)
 {
     meridian_state_t *state = calloc(1, sizeof(meridian_state_t));
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     meridian_error_t err;
     const char *wayland_display = getenv("WAYLAND_DISPLAY");
@@ -215,7 +244,7 @@ meridian_get_gamma_size(const meridian_state_t *state, int crtc_idx)
 meridian_error_t
 meridian_set_temperature(meridian_state_t *state, int temp, float brightness)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     switch (state->backend) {
     case BACKEND_DRM:
@@ -241,7 +270,7 @@ meridian_error_t
 meridian_set_temperature_crtc(meridian_state_t *state, int crtc_idx,
                             int temp, float brightness)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     switch (state->backend) {
     case BACKEND_DRM:
@@ -266,7 +295,7 @@ meridian_set_temperature_crtc(meridian_state_t *state, int crtc_idx,
 meridian_error_t
 meridian_restore(meridian_state_t *state)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     switch (state->backend) {
     case BACKEND_DRM:

@@ -10,7 +10,7 @@
 VERSION  := 1.0.0
 
 CC       := gcc
-CFLAGS   := -std=c2x -O2 -march=native -fPIC -Wall -Wextra -Wpedantic
+CFLAGS   := -std=c2x -O2 -march=native -fPIC -MMD -MP -Wall -Wextra -Wpedantic
 CFLAGS   += -I./include
 LDFLAGS  := -shared
 LIBS     := -lm
@@ -128,8 +128,10 @@ endif
 $(TARGET): $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(INCDIR)/meridian.h | $(BUILDDIR)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+-include $(OBJECTS:.o=.d)
 
 clean:
 	rm -rf $(BUILDDIR) $(TARGET) libmeridian.a

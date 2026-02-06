@@ -21,6 +21,8 @@
 #include "zipdb.h"
 
 #include <getopt.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -269,13 +271,33 @@ int main(int argc, char **argv)
         case 's': command = CMD_STATUS;   break;
         case 'l': command = CMD_SET_LOC;  loc_arg = optarg; break;
         case 'r': command = CMD_REFRESH;  break;
-        case 'S':
+        case 'S': {
             command = CMD_SET_TEMP;
-            set_temp_val = atoi(optarg);
+            char *end;
+            errno = 0;
+            long val = strtol(optarg, &end, 10);
+            if (*end != '\0' || end == optarg || errno == ERANGE
+                || val < INT_MIN || val > INT_MAX) {
+                fprintf(stderr, "Invalid temperature: %s\n", optarg);
+                usage();
+                return 1;
+            }
+            set_temp_val = (int)val;
             /* Check for optional duration in next arg */
-            if (optind < argc && argv[optind][0] != '-')
-                set_temp_dur = atoi(argv[optind++]);
+            if (optind < argc && argv[optind][0] != '-') {
+                errno = 0;
+                val = strtol(argv[optind], &end, 10);
+                if (*end != '\0' || end == argv[optind] || errno == ERANGE
+                    || val < 0 || val > INT_MAX) {
+                    fprintf(stderr, "Invalid duration: %s\n", argv[optind]);
+                    usage();
+                    return 1;
+                }
+                set_temp_dur = (int)val;
+                optind++;
+            }
             break;
+        }
         case 'R': command = CMD_RESUME;   break;
         case 'x': command = CMD_RESET;    break;
         case 'h': usage(); return 0;
@@ -300,13 +322,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    weather_init();
     int result = 0;
     switch (command) {
     case CMD_STATUS:
         cmd_status(loc.lat, loc.lon, &paths);
         break;
     case CMD_REFRESH:
-        weather_init();
         result = cmd_refresh(loc.lat, loc.lon, &paths);
         break;
     case CMD_SET_TEMP:

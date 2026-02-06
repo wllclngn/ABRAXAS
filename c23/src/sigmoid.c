@@ -12,6 +12,8 @@
 
 #include <math.h>
 
+constexpr int SECONDS_PER_DAY = 86400;
+
 static double sigmoid_raw(double x, double steepness)
 {
     return 1.0 / (1.0 + exp(-steepness * x));
@@ -76,7 +78,7 @@ int calculate_manual_temp(int start_temp, int target_temp,
 time_t next_transition_resume(time_t now, double lat, double lon)
 {
     sun_times_t st = solar_sunrise_sunset(now, lat, lon);
-    if (!st.valid) return now + 86400; /* polar fallback: 24h */
+    if (!st.valid) return now + SECONDS_PER_DAY; /* polar fallback: 24h */
 
     time_t dawn_window_start = st.sunrise - (time_t)(DAWN_DURATION / 2) * 60;
     time_t dusk_window_start = st.sunset  - (time_t)(DUSK_DURATION / 2) * 60;
@@ -92,8 +94,8 @@ time_t next_transition_resume(time_t now, double lat, double lon)
     if (best > 0) return best;
 
     /* Both today's transitions passed -- use tomorrow's dawn */
-    time_t tomorrow = now + 86400;
+    time_t tomorrow = now + SECONDS_PER_DAY;
     sun_times_t st2 = solar_sunrise_sunset(tomorrow, lat, lon);
-    if (!st2.valid) return now + 86400;
+    if (!st2.valid) return now + SECONDS_PER_DAY;
     return st2.sunrise - (time_t)(DAWN_DURATION / 2 + 15) * 60;
 }

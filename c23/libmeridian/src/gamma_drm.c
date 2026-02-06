@@ -136,34 +136,6 @@ drm_set_gamma(int fd, struct drm_mode_crtc_lut *lut)
 }
 
 /* ============================================================
- * Error handling
- * ============================================================ */
-
-static const char *error_messages[] = {
-    [0] = "Success",
-    [-MERIDIAN_ERR_INVALID_TEMP] = "Invalid temperature",
-    [-MERIDIAN_ERR_DRM_OPEN] = "Failed to open DRM device",
-    [-MERIDIAN_ERR_DRM_RESOURCES] = "Failed to get DRM resources",
-    [-MERIDIAN_ERR_DRM_CRTC] = "Failed to get CRTC info",
-    [-MERIDIAN_ERR_DRM_GAMMA] = "Failed to set gamma",
-    [-MERIDIAN_ERR_NO_CRTC] = "No usable CRTC found",
-    [-MERIDIAN_ERR_PERMISSION] = "Permission denied (need video group?)",
-    [-MERIDIAN_ERR_WAYLAND_CONNECT] = "Failed to connect to Wayland display",
-    [-MERIDIAN_ERR_WAYLAND_PROTOCOL] = "Wayland compositor lacks gamma control protocol",
-    [-MERIDIAN_ERR_GNOME_DBUS] = "Failed to communicate with Mutter via DBus",
-};
-
-const char *
-meridian_strerror(meridian_error_t err)
-{
-    int idx = -err;
-    if (idx >= 0 && idx < (int)(sizeof(error_messages) / sizeof(error_messages[0]))) {
-        return error_messages[idx] ? error_messages[idx] : "Unknown error";
-    }
-    return "Unknown error";
-}
-
-/* ============================================================
  * Public API
  * ============================================================ */
 
@@ -171,7 +143,7 @@ meridian_error_t
 meridian_drm_init(int card_num, meridian_drm_state_t **state_out)
 {
     meridian_drm_state_t *state = calloc(1, sizeof(meridian_drm_state_t));
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     state->card_num = card_num;
     state->fd = -1;
@@ -183,7 +155,7 @@ meridian_drm_init(int card_num, meridian_drm_state_t **state_out)
     state->fd = open(path, O_RDWR | O_CLOEXEC);
     if (state->fd < 0) {
         free(state);
-        return (errno == EACCES) ? MERIDIAN_ERR_PERMISSION : MERIDIAN_ERR_DRM_OPEN;
+        return (errno == EACCES) ? MERIDIAN_ERR_PERMISSION : MERIDIAN_ERR_OPEN;
     }
 
     /* First call: get count of CRTCs */
@@ -191,7 +163,7 @@ meridian_drm_init(int card_num, meridian_drm_state_t **state_out)
     if (drm_get_resources(state->fd, &res) < 0) {
         close(state->fd);
         free(state);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     if (res.count_crtcs == 0) {
@@ -205,7 +177,7 @@ meridian_drm_init(int card_num, meridian_drm_state_t **state_out)
     if (!state->crtc_ids) {
         close(state->fd);
         free(state);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     /* Second call: actually get CRTC IDs */
@@ -214,7 +186,7 @@ meridian_drm_init(int card_num, meridian_drm_state_t **state_out)
         free(state->crtc_ids);
         close(state->fd);
         free(state);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     state->crtc_count = res.count_crtcs;
@@ -225,7 +197,7 @@ meridian_drm_init(int card_num, meridian_drm_state_t **state_out)
         free(state->crtc_ids);
         close(state->fd);
         free(state);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     /* Initialize each CRTC and save original gamma */
@@ -329,12 +301,12 @@ meridian_drm_set_temperature_crtc(meridian_drm_state_t *state, int crtc_idx,
                                 int temp, float brightness)
 {
     if (!state || crtc_idx < 0 || crtc_idx >= state->crtc_count) {
-        return MERIDIAN_ERR_DRM_CRTC;
+        return MERIDIAN_ERR_CRTC;
     }
 
     crtc_state_t *crtc = &state->crtcs[crtc_idx];
     if (crtc->gamma_size <= 1) {
-        return MERIDIAN_ERR_DRM_CRTC;
+        return MERIDIAN_ERR_CRTC;
     }
 
     /* Allocate temporary ramps */
@@ -345,7 +317,7 @@ meridian_drm_set_temperature_crtc(meridian_drm_state_t *state, int crtc_idx,
 
     if (!r || !g || !b) {
         free(r); free(g); free(b);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     /* Fill ramps with color temperature */
@@ -368,13 +340,13 @@ meridian_drm_set_temperature_crtc(meridian_drm_state_t *state, int crtc_idx,
 
     free(r); free(g); free(b);
 
-    return (ret < 0) ? MERIDIAN_ERR_DRM_GAMMA : MERIDIAN_OK;
+    return (ret < 0) ? MERIDIAN_ERR_GAMMA : MERIDIAN_OK;
 }
 
 meridian_error_t
 meridian_drm_set_temperature(meridian_drm_state_t *state, int temp, float brightness)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     meridian_error_t last_err = MERIDIAN_OK;
     int success_count = 0;
@@ -397,7 +369,7 @@ meridian_drm_set_temperature(meridian_drm_state_t *state, int temp, float bright
 meridian_error_t
 meridian_drm_restore(meridian_drm_state_t *state)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     for (int i = 0; i < state->crtc_count; i++) {
         crtc_state_t *crtc = &state->crtcs[i];

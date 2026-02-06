@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
+#include <ctype.h>
 #include <time.h>
 
 /* Dynamic response buffer for libcurl */
@@ -72,7 +72,8 @@ static bool http_get(const char *url, response_buf_t *resp)
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    constexpr long CURL_TIMEOUT_SEC = 10L;
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, CURL_TIMEOUT_SEC);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
     CURLcode res = curl_easy_perform(curl);
@@ -105,7 +106,7 @@ static int cloud_cover_from_forecast(const char *forecast)
     char lower[128];
     size_t i = 0;
     for (; forecast[i] && i < sizeof(lower) - 1; i++)
-        lower[i] = (char)(forecast[i] | 0x20); /* ASCII tolower */
+        lower[i] = (char)tolower((unsigned char)forecast[i]);
     lower[i] = '\0';
 
     /* Precipitation always means heavy cloud */

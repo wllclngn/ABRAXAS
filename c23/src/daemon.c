@@ -146,13 +146,15 @@ void daemon_run(daemon_state_t *state)
 
     /* Retry gamma init -- display server may not be ready at boot.
      * Poll every 500ms for up to 30s to catch X11/Wayland readiness fast. */
-    for (int attempt = 0; attempt < 60; attempt++) {
+    constexpr int  GAMMA_INIT_MAX_RETRIES = 60;
+    constexpr long GAMMA_INIT_RETRY_NS    = 500000000L; /* 500ms */
+    for (int attempt = 0; attempt < GAMMA_INIT_MAX_RETRIES; attempt++) {
         if (gamma_init()) break;
-        if (attempt == 59) {
+        if (attempt == GAMMA_INIT_MAX_RETRIES - 1) {
             fprintf(stderr, "[fatal] No gamma backend after 30s\n");
             exit(1);
         }
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000000 };
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = GAMMA_INIT_RETRY_NS };
         nanosleep(&ts, nullptr);
     }
 
@@ -262,6 +264,7 @@ void daemon_run(daemon_state_t *state)
         if (inotify_fd >= 0 && FD_ISSET(inotify_fd, &readfds)) {
             char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
             ssize_t len = read(inotify_fd, buf, sizeof(buf));
+            if (len <= 0) goto skip_inotify;
 
             for (char *ptr = buf; ptr < buf + len; ) {
                 struct inotify_event *event = (struct inotify_event *)ptr;
@@ -285,6 +288,7 @@ void daemon_run(daemon_state_t *state)
                 }
                 ptr += sizeof(struct inotify_event) + event->len;
             }
+        skip_inotify:;
         }
 
         time_t now = time(nullptr);

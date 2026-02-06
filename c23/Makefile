@@ -4,7 +4,7 @@
 # NOAA=0 disables weather features and drops the libcurl dependency.
 
 CC       := gcc
-CFLAGS   := -std=c2x -O2 -march=native -Wall -Wextra -Wpedantic
+CFLAGS   := -std=c2x -O2 -march=native -MMD -MP -Wall -Wextra -Wpedantic
 CFLAGS   += -Iinclude -Ilibmeridian/include
 
 BUILDDIR := build
@@ -56,6 +56,8 @@ $(TARGET): $(OBJECTS) $(LIBM_A)
 
 $(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+-include $(OBJECTS:.o=.d)
 
 clean:
 	rm -rf $(BUILDDIR) $(TARGET)

@@ -128,7 +128,8 @@ override_state_t config_load_override(const abraxas_paths_t *paths)
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (sz <= 0 || sz > 4096) { fclose(f); return ovr; }
+    constexpr long MAX_OVERRIDE_FILE_SIZE = 4096;
+    if (sz <= 0 || sz > MAX_OVERRIDE_FILE_SIZE) { fclose(f); return ovr; }
 
     char *buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return ovr; }
@@ -196,7 +197,8 @@ weather_data_t config_load_weather_cache(const abraxas_paths_t *paths)
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (sz <= 0 || sz > 8192) { fclose(f); return wd; }
+    constexpr long MAX_WEATHER_FILE_SIZE = 8192;
+    if (sz <= 0 || sz > MAX_WEATHER_FILE_SIZE) { fclose(f); return wd; }
 
     char *buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return wd; }
@@ -242,6 +244,30 @@ weather_data_t config_load_weather_cache(const abraxas_paths_t *paths)
     return wd;
 }
 
+static void json_write_string(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"':  fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\b': fputs("\\b", f);  break;
+        case '\f': fputs("\\f", f);  break;
+        case '\n': fputs("\\n", f);  break;
+        case '\r': fputs("\\r", f);  break;
+        case '\t': fputs("\\t", f);  break;
+        default:
+            if (c < 0x20)
+                fprintf(f, "\\u%04x", c);
+            else
+                fputc(c, f);
+            break;
+        }
+    }
+    fputc('"', f);
+}
+
 bool config_save_weather_cache(const abraxas_paths_t *paths, const weather_data_t *wd)
 {
     FILE *f = fopen(paths->cache_file, "w");
@@ -256,7 +282,9 @@ bool config_save_weather_cache(const abraxas_paths_t *paths, const weather_data_
     } else {
         fprintf(f, "{\n");
         fprintf(f, "  \"cloud_cover\": %d,\n", wd->cloud_cover);
-        fprintf(f, "  \"forecast\": \"%s\",\n", wd->forecast);
+        fprintf(f, "  \"forecast\": ");
+        json_write_string(f, wd->forecast);
+        fprintf(f, ",\n");
         fprintf(f, "  \"temperature\": %.1f,\n", wd->temperature);
         fprintf(f, "  \"is_day\": %s,\n", wd->is_day ? "true" : "false");
         fprintf(f, "  \"fetched_at\": %ld\n", (long)wd->fetched_at);

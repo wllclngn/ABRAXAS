@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import os
+import pwd
 import sys
 import shutil
 import subprocess
@@ -27,7 +28,10 @@ from datetime import datetime
 
 # Use SUDO_USER's home if running under sudo, otherwise current user's home
 _real_user = os.environ.get("SUDO_USER", os.environ.get("USER"))
-_real_home = Path(f"/home/{_real_user}") if _real_user else Path.home()
+try:
+    _real_home = Path(pwd.getpwnam(_real_user).pw_dir) if _real_user else Path.home()
+except KeyError:
+    _real_home = Path.home()
 
 INSTALL_BINARY = _real_home / ".local" / "bin" / "abraxas"
 INSTALL_CONFIG_DIR = _real_home / ".config" / "abraxas"
@@ -163,20 +167,21 @@ def restart_service() -> bool:
 # BUILD
 # =============================================================================
 
-def build_abraxas(source_dir: Path, force: bool = False,
-                  non_usa: bool = False) -> bool:
-    """Build abraxas binary (statically links libmeridian)."""
-    binary = source_dir / "abraxas"
+def build_abraxas_c23(source_dir: Path, force: bool = False,
+                      non_usa: bool = False) -> bool:
+    """Build abraxas C23 binary (statically links libmeridian)."""
+    c23_dir = source_dir / "c23"
+    binary = c23_dir / "abraxas"
 
     # Skip build if already exists (unless forced)
     if binary.exists() and not force:
-        log_info("abraxas already built (use --rebuild to force)")
+        log_info("abraxas (C23) already built (use --rebuild to force)")
         return True
 
     if non_usa:
-        log_info("BUILDING ABRAXAS (non-USA: weather disabled)")
+        log_info("BUILDING ABRAXAS [C23] (non-USA: weather disabled)")
     else:
-        log_info("BUILDING ABRAXAS")
+        log_info("BUILDING ABRAXAS [C23]")
 
     # Check for make
     ret, _, _ = run_cmd_capture(["which", "make"])
@@ -191,18 +196,83 @@ def build_abraxas(source_dir: Path, force: bool = False,
         return False
 
     # Build (top-level make builds libmeridian.a then daemon)
-    make_cmd = ["make", "-C", str(source_dir)]
+    make_cmd = ["make", "-C", str(c23_dir)]
     if non_usa:
         make_cmd.append("NOAA=0")
     ret = run_cmd(make_cmd + ["clean"])
     ret = run_cmd(make_cmd)
 
     if ret != 0:
-        log_error("Build failed!")
+        log_error("C23 build failed!")
         return False
 
     if not binary.exists():
         log_error("Build completed but abraxas binary not found")
+        return False
+
+    log_info(f"Built: {binary}")
+    return True
+
+
+def build_abraxas_rust(source_dir: Path, non_usa: bool = False) -> bool:
+    """Build abraxas via cargo."""
+    rust_dir = source_dir / "rust"
+
+    if not rust_dir.exists():
+        log_error("Rust source not found at rust/")
+        return False
+
+    # Check for cargo
+    ret, _, _ = run_cmd_capture(["which", "cargo"])
+    if ret != 0:
+        log_error("cargo not found. Install Rust: https://rustup.rs")
+        return False
+
+    log_info("BUILDING ABRAXAS [Rust]")
+
+    # Detect available backends via pkg-config
+    features = []
+
+    ret, _, _ = run_cmd_capture(["pkg-config", "--exists", "wayland-client"])
+    if ret == 0:
+        features.append("wayland")
+        log_info("  Wayland backend: enabled")
+    else:
+        log_info("  Wayland backend: disabled (no wayland-client)")
+
+    ret, _, _ = run_cmd_capture(["pkg-config", "--exists", "libsystemd"])
+    if ret == 0:
+        features.append("gnome")
+        log_info("  GNOME backend:   enabled")
+    else:
+        log_info("  GNOME backend:   disabled (no libsystemd)")
+
+    # X11 backend doesn't need pkg-config (x11rb is pure Rust protocol impl)
+    # but check if X11 libs exist as a signal the user wants X11 support
+    if check_x11_libs():
+        features.append("x11")
+        log_info("  X11 backend:     enabled")
+    else:
+        log_info("  X11 backend:     disabled (no libx11/libxrandr)")
+
+    log_info("  DRM backend:     always enabled")
+
+    if not non_usa:
+        features.append("noaa")
+
+    cargo_cmd = ["cargo", "build", "--release", "--no-default-features"]
+    if features:
+        cargo_cmd.extend(["--features", ",".join(features)])
+
+    ret = run_cmd(cargo_cmd, cwd=rust_dir)
+
+    if ret != 0:
+        log_error("Rust build failed!")
+        return False
+
+    binary = rust_dir / "target" / "release" / "abraxas"
+    if not binary.exists():
+        log_error("Build completed but binary not found")
         return False
 
     log_info(f"Built: {binary}")
@@ -217,47 +287,96 @@ def cmd_install(args, source_dir: Path) -> bool:
     """Install abraxas."""
     log_info("INSTALLING ABRAXAS")
 
-    source_binary = source_dir / "abraxas"
     source_service = source_dir / "abraxas.service"
     source_zipdb = source_dir / "us_zipcodes.bin"
+
+    # Determine implementation: --impl flag overrides, otherwise prompt
+    if args.impl_choice:
+        impl_choice = args.impl_choice
+    else:
+        print()
+        try:
+            while True:
+                response = input(
+                    "Which implementation? C23 or Rust (see --test for comparison) [C/Rust]: "
+                ).strip().lower()
+                if response in ("c", "c23"):
+                    impl_choice = "c23"
+                    break
+                elif response in ("r", "rust"):
+                    impl_choice = "rust"
+                    break
+        except EOFError:
+            print()
+            log_info("No input (non-interactive). Defaulting to C23.")
+            impl_choice = "c23"
+        print()
 
     # Determine NOAA mode: --non-usa flag overrides, otherwise prompt
     if args.non_usa:
         non_usa = True
     else:
         print()
-        while True:
-            response = input(
-                "ABRAXAS allows for utilization of US-specific NOAA data\n"
-                "for weather calculations. Do you wish to enable NOAA\n"
-                "data calculations? [Y/N]: "
-            ).strip()
-            if response in ("y", "Y"):
-                non_usa = False
-                break
-            elif response in ("n", "N"):
-                non_usa = True
-                break
+        try:
+            while True:
+                response = input(
+                    "ABRAXAS allows for utilization of US-specific NOAA data\n"
+                    "for weather calculations. Do you wish to enable NOAA\n"
+                    "data calculations? [Y/N]: "
+                ).strip()
+                if response in ("y", "Y"):
+                    non_usa = False
+                    break
+                elif response in ("n", "N"):
+                    non_usa = True
+                    break
+        except EOFError:
+            print()
+            log_info("No input (non-interactive). Defaulting to non-USA build.")
+            non_usa = True
         print()
 
-    # Build (always force -- user just chose NOAA config)
-    if not build_abraxas(source_dir, force=True, non_usa=non_usa):
-        return False
+    # Build chosen implementation
+    if impl_choice == "rust":
+        if not build_abraxas_rust(source_dir, non_usa=non_usa):
+            return False
+        source_binary = source_dir / "rust" / "target" / "release" / "abraxas"
+    else:
+        if not build_abraxas_c23(source_dir, force=True, non_usa=non_usa):
+            return False
+        source_binary = source_dir / "c23" / "abraxas"
+
+    # Save implementation choice for future updates
+    impl_file = INSTALL_CONFIG_DIR / "impl"
 
     # Create directories
     log_info("Creating directories...")
-    INSTALL_BINARY.parent.mkdir(parents=True, exist_ok=True)
-    INSTALL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    INSTALL_SERVICE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        INSTALL_BINARY.parent.mkdir(parents=True, exist_ok=True)
+        INSTALL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        INSTALL_SERVICE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log_error(f"Failed to create directories: {e}")
+        return False
+
+    # Write impl choice after config dir exists
+    try:
+        impl_file.write_text(impl_choice + "\n")
+    except OSError:
+        pass
 
     # Stop running abraxas before overwriting binary (ETXTBSY)
-    subprocess.run(["systemctl", "--user", "stop", "abraxas"], capture_output=True)
+    subprocess.run(get_systemctl_cmd() + ["stop", "abraxas.service"], capture_output=True)
     subprocess.run(["pkill", "-x", "abraxas"], capture_output=True)
 
     # Copy binary
-    log_info(f"Installing {INSTALL_BINARY}...")
-    shutil.copy2(source_binary, INSTALL_BINARY)
-    INSTALL_BINARY.chmod(0o755)
+    log_info(f"Installing {INSTALL_BINARY} [{impl_choice}]...")
+    try:
+        shutil.copy2(source_binary, INSTALL_BINARY)
+        INSTALL_BINARY.chmod(0o755)
+    except OSError as e:
+        log_error(f"Failed to install binary: {e}")
+        return False
 
     # Copy ZIP database (skip for non-USA builds)
     if not non_usa:
@@ -285,14 +404,18 @@ def cmd_install(args, source_dir: Path) -> bool:
 
     # Fix ownership if running as root
     if os.environ.get("SUDO_USER"):
-        uid = int(subprocess.run(["id", "-u", _real_user], capture_output=True, text=True).stdout.strip())
-        gid = int(subprocess.run(["id", "-g", _real_user], capture_output=True, text=True).stdout.strip())
+        try:
+            pw = pwd.getpwnam(_real_user)
+            uid, gid = pw.pw_uid, pw.pw_gid
 
-        os.chown(INSTALL_BINARY, uid, gid)
-        os.chown(INSTALL_SERVICE, uid, gid)
+            os.chown(INSTALL_BINARY, uid, gid)
+            if INSTALL_SERVICE.exists():
+                os.chown(INSTALL_SERVICE, uid, gid)
 
-        for f in INSTALL_CONFIG_DIR.iterdir():
-            os.chown(f, uid, gid)
+            for f in INSTALL_CONFIG_DIR.iterdir():
+                os.chown(f, uid, gid)
+        except (KeyError, OSError) as e:
+            log_warn(f"Failed to fix ownership: {e}")
 
     print()
     log_info("SUCCESS. Installation complete.")
@@ -381,6 +504,18 @@ def cmd_status(args, source_dir: Path) -> bool:
     print(f"  X11 fallback: {'available' if x11_ok else 'not available (install libx11 libxrandr)'}")
     print()
 
+    # Detect implementation language
+    if binary_ok:
+        impl_file = INSTALL_CONFIG_DIR / "impl"
+        if impl_file.exists():
+            lang = impl_file.read_text().strip().upper()
+        else:
+            # Heuristic: C23 binary is ~75KB, Rust is ~2.6MB
+            size = INSTALL_BINARY.stat().st_size
+            lang = "RUST" if size > 500_000 else "C23"
+        print(f"  Language: {lang}")
+        print()
+
     print(f"  Overall: {'INSTALLED' if binary_ok else 'NOT INSTALLED'}")
 
     return binary_ok
@@ -400,9 +535,64 @@ def cmd_disable(args, source_dir: Path) -> bool:
     return disable_service()
 
 
+def cmd_test(args, source_dir: Path) -> bool:
+    """Show implementation comparison table."""
+    print()
+    print("  ════════════════════════════════════════════════════════════")
+    print("                  MAIN EVENT: C23 vs. Rust")
+    print("  ════════════════════════════════════════════════════════════")
+    print("  ┌──────────────────┬───────────────────┬───────────────────┐")
+    print("  │                  │ C23               │ Rust              │")
+    print("  ├──────────────────┼───────────────────┼───────────────────┤")
+    print("  │ Compiler         │ GCC 14 (-std=c2x) │ rustc 1.75+       │")
+    print("  │ Binary size      │ ~75 KB            │ ~2.6 MB           │")
+    print("  │ Source LOC       │ ~5,100            │ ~2,900            │")
+    print("  │ Memory model     │ manual alloc/free │ ownership/borrow  │")
+    print("  │ Gamma: DRM       │ raw ioctl         │ raw ioctl         │")
+    print("  │ Gamma: Wayland   │ libwayland-client │ wayland-client    │")
+    print("  │ Gamma: X11       │ libX11+libXrandr  │ x11rb             │")
+    print("  │ Gamma: GNOME     │ libsystemd/sd-bus │ libsystemd/sd-bus │")
+    print("  │ Weather          │ libcurl           │ ureq              │")
+    print("  │ Config parse     │ hand-rolled JSON  │ serde_json        │")
+    print("  │ CLI args         │ getopt_long       │ hand-rolled       │")
+    print("  │ Timer/signals    │ timerfd+signalfd  │ thread::sleep     │")
+    print("  └──────────────────┴───────────────────┴───────────────────┘")
+
+    # Show actual binary sizes if built
+    c23_bin = source_dir / "c23" / "abraxas"
+    rust_bin = source_dir / "rust" / "target" / "release" / "abraxas"
+    print()
+    if c23_bin.exists():
+        size = c23_bin.stat().st_size
+        log_info(f"C23 binary:  {c23_bin} ({size // 1024} KB)")
+    else:
+        log_info("C23 binary:  not built")
+    if rust_bin.exists():
+        size = rust_bin.stat().st_size
+        log_info(f"Rust binary: {rust_bin} ({size // 1024} KB)")
+    else:
+        log_info("Rust binary: not built")
+
+    # Show installed implementation
+    impl_file = INSTALL_CONFIG_DIR / "impl"
+    if impl_file.exists():
+        print()
+        log_info(f"Installed:   {impl_file.read_text().strip()}")
+
+    print()
+    return True
+
+
 def cmd_update(args, source_dir: Path) -> bool:
     """Update abraxas if source is newer."""
     log_info("CHECKING FOR UPDATES")
+
+    # Detect installed implementation
+    impl_file = INSTALL_CONFIG_DIR / "impl"
+    impl_choice = "c23"  # default
+    if impl_file.exists():
+        impl_choice = impl_file.read_text().strip()
+    log_info(f"Implementation: {impl_choice}")
 
     needs_rebuild = False
 
@@ -410,16 +600,28 @@ def cmd_update(args, source_dir: Path) -> bool:
     if INSTALL_BINARY.exists():
         installed_mtime = INSTALL_BINARY.stat().st_mtime
 
-        # Check daemon sources
-        for pattern in ["src/*.[ch]", "include/*.[ch]", "libmeridian/src/*.[ch]",
-                        "libmeridian/include/*.[ch]"]:
-            for src_file in source_dir.glob(pattern):
-                if src_file.stat().st_mtime > installed_mtime:
-                    needs_rebuild = True
-                    log_info(f"Source updated: {src_file.name}")
+        if impl_choice == "rust":
+            # Check Rust sources
+            for pattern in ["rust/src/**/*.rs", "rust/Cargo.toml"]:
+                for src_file in source_dir.glob(pattern):
+                    if src_file.stat().st_mtime > installed_mtime:
+                        needs_rebuild = True
+                        log_info(f"Source updated: {src_file.name}")
+                        break
+                if needs_rebuild:
                     break
-            if needs_rebuild:
-                break
+        else:
+            # Check C23 sources
+            for pattern in ["c23/src/*.[ch]", "c23/include/*.[ch]",
+                            "c23/libmeridian/src/*.[ch]",
+                            "c23/libmeridian/include/*.[ch]"]:
+                for src_file in source_dir.glob(pattern):
+                    if src_file.stat().st_mtime > installed_mtime:
+                        needs_rebuild = True
+                        log_info(f"Source updated: {src_file.name}")
+                        break
+                if needs_rebuild:
+                    break
 
         if not needs_rebuild:
             log_info("Already up to date")
@@ -428,21 +630,28 @@ def cmd_update(args, source_dir: Path) -> bool:
         needs_rebuild = True
         log_info("Binary: not installed")
 
-    # Rebuild
+    # Rebuild with detected implementation
     non_usa = getattr(args, 'non_usa', False)
-    if not build_abraxas(source_dir, force=True, non_usa=non_usa):
-        return False
+    if impl_choice == "rust":
+        if not build_abraxas_rust(source_dir, non_usa=non_usa):
+            return False
+        source_binary = source_dir / "rust" / "target" / "release" / "abraxas"
+    else:
+        if not build_abraxas_c23(source_dir, force=True, non_usa=non_usa):
+            return False
+        source_binary = source_dir / "c23" / "abraxas"
 
-    source_binary = source_dir / "abraxas"
     log_info("Installing updates...")
     shutil.copy2(source_binary, INSTALL_BINARY)
     INSTALL_BINARY.chmod(0o755)
 
     # Fix ownership if running as root
     if os.environ.get("SUDO_USER"):
-        uid = int(subprocess.run(["id", "-u", _real_user], capture_output=True, text=True).stdout.strip())
-        gid = int(subprocess.run(["id", "-g", _real_user], capture_output=True, text=True).stdout.strip())
-        os.chown(INSTALL_BINARY, uid, gid)
+        try:
+            pw = pwd.getpwnam(_real_user)
+            os.chown(INSTALL_BINARY, pw.pw_uid, pw.pw_gid)
+        except (KeyError, OSError) as e:
+            log_warn(f"Failed to fix ownership: {e}")
 
     restart_service()
     log_info("Update complete")
@@ -466,11 +675,15 @@ Commands:
   enable      Enable systemd service
   disable     Disable systemd service
   update      Update if source is newer
+  test        Show C23 vs Rust comparison table
 
 Examples:
-  ./install.py                    # Install and optionally enable service
+  ./install.py                    # Install (prompts for C23 or Rust, NOAA)
+  ./install.py --impl c23         # Install C23 implementation
+  ./install.py --impl rust        # Install Rust implementation
   ./install.py --no-service       # Install without prompting for service
   ./install.py --non-usa          # Install without NOAA weather (no libcurl)
+  ./install.py test               # Show implementation comparison
   ./install.py status             # Check installation status
   ./install.py enable             # Enable service
   ./install.py uninstall          # Remove installation
@@ -478,7 +691,7 @@ Examples:
     )
 
     parser.add_argument("command", nargs="?", default="install",
-                       choices=["install", "uninstall", "status", "enable", "disable", "update"],
+                       choices=["install", "uninstall", "status", "enable", "disable", "update", "test"],
                        help="Command to run (default: install)")
     parser.add_argument("--no-service", action="store_true",
                        help="Don't prompt to enable service after install")
@@ -486,8 +699,17 @@ Examples:
                        help="Force rebuild even if already built")
     parser.add_argument("--non-usa", action="store_true",
                        help="Disable NOAA weather (no libcurl dependency)")
+    parser.add_argument("--impl", dest="impl_choice", choices=["c23", "rust"],
+                       default=None,
+                       help="Choose implementation (default: prompt)")
+    parser.add_argument("--test", action="store_true",
+                       help="Show C23 vs Rust comparison table")
 
     args = parser.parse_args()
+
+    # --test flag overrides command
+    if args.test:
+        args.command = "test"
 
     source_dir = Path(__file__).parent.resolve()
 
@@ -504,6 +726,7 @@ Examples:
         "enable": cmd_enable,
         "disable": cmd_disable,
         "update": cmd_update,
+        "test": cmd_test,
     }
 
     success = commands[args.command](args, source_dir)

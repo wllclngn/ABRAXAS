@@ -136,7 +136,7 @@ meridian_error_t
 meridian_wl_init(meridian_wl_state_t **state_out)
 {
     struct meridian_wl_state *state = calloc(1, sizeof(*state));
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     state->display = wl_display_connect(nullptr);
     if (!state->display) {
@@ -148,7 +148,12 @@ meridian_wl_init(meridian_wl_state_t **state_out)
     wl_registry_add_listener(state->registry, &registry_listener, state);
 
     /* First roundtrip: discover globals (manager + outputs) */
-    wl_display_roundtrip(state->display);
+    if (wl_display_roundtrip(state->display) < 0) {
+        wl_registry_destroy(state->registry);
+        wl_display_disconnect(state->display);
+        free(state);
+        return MERIDIAN_ERR_WAYLAND_CONNECT;
+    }
 
     if (!state->gamma_manager) {
         /* Compositor doesn't support wlr-gamma-control */
@@ -178,7 +183,10 @@ meridian_wl_init(meridian_wl_state_t **state_out)
     }
 
     /* Second roundtrip: receive gamma_size events (or failed) */
-    wl_display_roundtrip(state->display);
+    if (wl_display_roundtrip(state->display) < 0) {
+        meridian_wl_free(state);
+        return MERIDIAN_ERR_WAYLAND_CONNECT;
+    }
 
     /* Check that at least one output has usable gamma */
     int usable = 0;
@@ -266,17 +274,17 @@ wl_set_gamma_crtc(struct meridian_wl_state *state, int crtc_idx,
 
     /* Create memfd for gamma ramp transfer */
     int fd = memfd_create("meridian-gamma", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    if (fd < 0) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (fd < 0) return MERIDIAN_ERR_RESOURCES;
 
     if (ftruncate(fd, (off_t)total) < 0) {
         close(fd);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     uint16_t *map = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
         close(fd);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     uint16_t *r = map;
@@ -315,7 +323,7 @@ meridian_wl_set_temperature_crtc(meridian_wl_state_t *state, int crtc_idx,
 meridian_error_t
 meridian_wl_set_temperature(meridian_wl_state_t *state, int temp, float brightness)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     meridian_error_t last_err = MERIDIAN_OK;
     int success_count = 0;
@@ -341,7 +349,7 @@ meridian_wl_set_temperature(meridian_wl_state_t *state, int temp, float brightne
 meridian_error_t
 meridian_wl_restore(meridian_wl_state_t *state)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     /*
      * wlr-gamma-control restores original gamma when the control object
@@ -369,7 +377,8 @@ meridian_wl_restore(meridian_wl_state_t *state)
                                             &gamma_control_listener, out);
     }
 
-    wl_display_roundtrip(state->display);
+    if (wl_display_roundtrip(state->display) < 0)
+        return MERIDIAN_ERR_WAYLAND_CONNECT;
     return MERIDIAN_OK;
 }
 

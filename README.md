@@ -1,6 +1,6 @@
 # ABRAXAS
 
-A single-binary C23 daemon that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location. ABRAXAS allows for USA-specific builds (alongside manual calls for international users) which utilize NOAA data to further assist in screen temperature shifts during non-ideal weather.
+A daemon that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location. Ships in two competing implementations -- C23 and Rust -- each forcing the other to be better. ABRAXAS allows for USA-specific builds (alongside manual calls for international users) which utilize NOAA data to further assist in screen temperature shifts during non-ideal weather.
 
 **Key Features:**
 
@@ -48,7 +48,37 @@ A single-binary C23 daemon that smoothly adjusts your screen's color temperature
 | Dependencies | geoclue, X11 | cron, redshift | libc, libm (all backends optional) |
 | Scheduler needed | Yes | Is the scheduler | No |
 
+## MAIN EVENT: C23 vs. Rust
+
+Both implementations produce the same `abraxas` binary, same CLI interface, same config files, same systemd service. Pick at install time.
+
+|                  | C23                | Rust               |
+|------------------|--------------------|--------------------|
+| Compiler         | GCC 14 (-std=c2x)  | rustc 1.75+        |
+| Binary size      | ~75 KB             | ~2.6 MB            |
+| Source LOC       | ~5,100             | ~2,900             |
+| Memory model     | manual alloc/free  | ownership/borrow   |
+| Gamma: DRM       | raw ioctl          | raw ioctl          |
+| Gamma: Wayland   | libwayland-client  | wayland-client     |
+| Gamma: X11       | libX11 + libXrandr | x11rb              |
+| Gamma: GNOME     | libsystemd/sd-bus  | libsystemd/sd-bus  |
+| Weather          | libcurl            | ureq               |
+| Config parse     | hand-rolled JSON   | serde_json         |
+| CLI args         | getopt_long        | hand-rolled        |
+| Timer/signals    | timerfd + signalfd | thread::sleep      |
+
 ## Architecture
+
+```
+ABRAXAS/
+  c23/              C23 implementation
+  rust/             Rust implementation
+  install.py        Installer (prompts C23 or Rust)
+  abraxas.service   Systemd user service
+  us_zipcodes.bin   ZIP code database (shared)
+```
+
+### C23 implementation
 
 ```
 abraxas (C23, single binary -- libmeridian statically linked)
@@ -61,16 +91,27 @@ abraxas (C23, single binary -- libmeridian statically linked)
     +-- libmeridian.a (C23, statically linked)
             |
             +-- Wayland backend: wlr-gamma-control protocol
-            |   (Sway, Hyprland, river, labwc, wayfire, niri)
-            |
             +-- GNOME backend: Mutter DBus (SetCrtcGamma)
-            |   (GNOME Wayland on Debian, Ubuntu, Fedora)
-            |
             +-- DRM backend: raw kernel ioctl to /dev/dri/card*
-            |   (AMD, Intel, Nouveau -- no libdrm dependency)
-            |
             +-- X11 backend: XRandR gamma
-                (NVIDIA proprietary driver fallback)
+```
+
+### Rust implementation
+
+```
+abraxas (Rust, single binary -- all backends compiled in via cargo features)
+    |
+    +-- NOAA sun ephemeris (same algorithm, std::f64)
+    +-- Weather from api.weather.gov (ureq)
+    +-- Sigmoid transition engine (same curve)
+    +-- Config via serde_json
+    |
+    +-- gamma module (no FFI to libmeridian)
+            |
+            +-- Wayland backend: wayland-client + wayland-protocols-wlr
+            +-- GNOME backend: raw sd-bus FFI (same as C23)
+            +-- DRM backend: raw kernel ioctl (same as C23)
+            +-- X11 backend: x11rb (pure Rust X11 protocol)
 ```
 
 ## Sigmoid Transitions
@@ -138,39 +179,51 @@ The weather API requires no API key. Rate limits are generous (per User-Agent).
 ### Dependencies
 
 ```bash
-# Required: build tools
+# C23: build tools
 pacman -S gcc make pkg-config
 
-# Optional: NOAA weather (US users)
-pacman -S curl
+# Rust: cargo
+pacman -S rustup && rustup default stable
 
-# Optional: Wayland backend (Sway, Hyprland, river, etc.)
+# Optional: NOAA weather (US users)
+pacman -S curl                          # C23 only; Rust uses reqwest crate
+
+# Optional: Wayland backend
 pacman -S wayland wayland-protocols
 
-# Optional: GNOME backend (GNOME Wayland)
+# Optional: GNOME backend
 pacman -S systemd-libs
 
 # Optional: X11 fallback (NVIDIA users)
 pacman -S libx11 libxrandr
 ```
 
-No runtime dependencies beyond libc and libm. libcurl is only required for US weather support. All backends are optional and auto-detected at build time.
+All backends are optional and auto-detected at build time.
 
 ### Build & Install
 
 ```bash
-# Automated installer (prompts for NOAA weather support)
+# Automated installer (prompts C23 or Rust, then NOAA)
 ./install.py
 
-# Skip prompt -- disable NOAA for non-US locations
-./install.py --non-usa
+# Non-interactive
+./install.py --impl c23                 # C23 implementation
+./install.py --impl rust                # Rust implementation
+./install.py --impl c23 --non-usa       # C23 without NOAA
+./install.py --impl rust --non-usa      # Rust without NOAA
 
-# Or manually:
-make                    # US build (links libcurl)
-make NOAA=0             # International build (no libcurl)
+# Show implementation comparison table
+./install.py --test
+
+# Or manually (C23):
+make -C c23                             # US build (links libcurl)
+make -C c23 NOAA=0                      # International build
 mkdir -p ~/.local/bin ~/.config/abraxas
-cp abraxas ~/.local/bin/
-cp us_zipcodes.bin ~/.config/abraxas/   # US only
+cp c23/abraxas ~/.local/bin/
+
+# Or manually (Rust):
+cd rust && cargo build --release --features noaa,wayland,x11,gnome
+cp target/release/abraxas ~/.local/bin/
 ```
 
 ### Setup

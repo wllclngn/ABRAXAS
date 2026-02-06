@@ -135,7 +135,7 @@ meridian_error_t
 meridian_gnome_init(meridian_gnome_state_t **state_out)
 {
     struct meridian_gnome_state *state = calloc(1, sizeof(*state));
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     int r = sd_bus_open_user(&state->bus);
     if (r < 0) {
@@ -254,7 +254,7 @@ meridian_error_t
 meridian_gnome_set_temperature(meridian_gnome_state_t *state,
                                int temp, float brightness)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     meridian_error_t last_err = MERIDIAN_OK;
     int success_count = 0;
@@ -279,7 +279,7 @@ meridian_gnome_set_temperature(meridian_gnome_state_t *state,
 meridian_error_t
 meridian_gnome_restore(meridian_gnome_state_t *state)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     /* Build linear ramp */
     uint16_t r[GNOME_GAMMA_SIZE], g[GNOME_GAMMA_SIZE], b[GNOME_GAMMA_SIZE];

@@ -32,13 +32,13 @@ meridian_error_t
 meridian_x11_init(meridian_x11_state_t **state_out)
 {
     meridian_x11_state_t *state = calloc(1, sizeof(meridian_x11_state_t));
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     /* Open display */
     state->display = XOpenDisplay(nullptr);
     if (!state->display) {
         free(state);
-        return MERIDIAN_ERR_DRM_OPEN;
+        return MERIDIAN_ERR_OPEN;
     }
 
     state->screen = DefaultScreen(state->display);
@@ -49,7 +49,7 @@ meridian_x11_init(meridian_x11_state_t **state_out)
     if (!state->resources) {
         XCloseDisplay(state->display);
         free(state);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     state->crtc_count = state->resources->ncrtc;
@@ -72,7 +72,7 @@ meridian_x11_init(meridian_x11_state_t **state_out)
         XRRFreeScreenResources(state->resources);
         XCloseDisplay(state->display);
         free(state);
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     /* Initialize each CRTC */
@@ -140,18 +140,18 @@ meridian_x11_set_temperature_crtc(meridian_x11_state_t *state, int crtc_idx,
                                 int temp, float brightness)
 {
     if (!state || crtc_idx < 0 || crtc_idx >= state->crtc_count) {
-        return MERIDIAN_ERR_DRM_CRTC;
+        return MERIDIAN_ERR_CRTC;
     }
 
     int gamma_size = state->gamma_sizes[crtc_idx];
     if (gamma_size <= 0) {
-        return MERIDIAN_ERR_DRM_CRTC;
+        return MERIDIAN_ERR_CRTC;
     }
 
     /* Allocate XRRCrtcGamma structure */
     XRRCrtcGamma *gamma = XRRAllocGamma(gamma_size);
     if (!gamma) {
-        return MERIDIAN_ERR_DRM_RESOURCES;
+        return MERIDIAN_ERR_RESOURCES;
     }
 
     /* Fill gamma ramps */
@@ -174,7 +174,7 @@ meridian_x11_set_temperature_crtc(meridian_x11_state_t *state, int crtc_idx,
 meridian_error_t
 meridian_x11_set_temperature(meridian_x11_state_t *state, int temp, float brightness)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     meridian_error_t last_err = MERIDIAN_OK;
     int success_count = 0;
@@ -196,7 +196,7 @@ meridian_x11_set_temperature(meridian_x11_state_t *state, int temp, float bright
 meridian_error_t
 meridian_x11_restore(meridian_x11_state_t *state)
 {
-    if (!state) return MERIDIAN_ERR_DRM_RESOURCES;
+    if (!state) return MERIDIAN_ERR_RESOURCES;
 
     for (int i = 0; i < state->crtc_count; i++) {
         if (state->saved_gamma[i]) {

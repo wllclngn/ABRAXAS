@@ -1,15 +1,18 @@
-# Compiled binary
-/abraxas
+# C23 build artifacts
+c23/build/
+c23/abraxas
+c23/libmeridian/build*/
+c23/libmeridian/libmeridian.so
+c23/libmeridian/libmeridian.a
 
-# Build directories and artifacts
-build/
-libmeridian/build*/
-libmeridian/libmeridian.so
-libmeridian/libmeridian.a
+# Rust build artifacts
+rust/target/
 
 # Compile artifacts
 *.o
 *.so
+*.d
+*.a
 
 # Python
 __pycache__/
