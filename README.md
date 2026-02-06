@@ -1,6 +1,6 @@
 # ABRAXAS
 
-A daemon that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location. Ships in two competing implementations -- C23 and Rust -- each forcing the other to be better. ABRAXAS allows for USA-specific builds (alongside manual calls for international users) which utilize NOAA data to further assist in screen temperature shifts during non-ideal weather.
+A daemon avaible in C23 or Rust that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location. ABRAXAS allows for USA-specific builds (alongside manual calls for international users) which utilize NOAA data to further assist in screen temperature shifts during non-ideal weather.
 
 **Key Features:**
 
