@@ -10,11 +10,13 @@ use std::path::PathBuf;
 use crate::{WEATHER_REFRESH_SEC, now_epoch};
 
 /// Resolved filesystem paths
+#[derive(Clone)]
 pub struct Paths {
     pub config_file: PathBuf,
     pub cache_file: PathBuf,
     pub override_file: PathBuf,
     pub zipdb_file: PathBuf,
+    pub pid_file: PathBuf,
 }
 
 impl Paths {
@@ -31,6 +33,7 @@ impl Paths {
             cache_file: config_dir.join("weather_cache.json"),
             override_file: config_dir.join("override.json"),
             zipdb_file: config_dir.join("us_zipcodes.bin"),
+            pid_file: config_dir.join("daemon.pid"),
         })
     }
 }
@@ -199,4 +202,31 @@ pub fn weather_needs_refresh(wd: &WeatherData) -> bool {
     }
     let now = now_epoch();
     (now - wd.fetched_at) > WEATHER_REFRESH_SEC
+}
+
+/// Check if daemon process is alive via PID file
+pub fn check_daemon_alive(paths: &Paths) -> bool {
+    let content = match fs::read_to_string(&paths.pid_file) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let pid: i32 = match content.trim().parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if pid <= 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Write daemon PID to PID file
+pub fn write_pid(paths: &Paths) -> Result<(), io::Error> {
+    let pid = unsafe { libc::getpid() };
+    fs::write(&paths.pid_file, format!("{}\n", pid))
+}
+
+/// Remove daemon PID file
+pub fn remove_pid(paths: &Paths) {
+    let _ = fs::remove_file(&paths.pid_file);
 }

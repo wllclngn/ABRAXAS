@@ -38,9 +38,9 @@ fn get_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
-            .timeout_read(std::time::Duration::from_secs(10))
-            .timeout_write(std::time::Duration::from_secs(10))
-            .user_agent("abraxas/3.0 (weather color temp daemon)")
+            .timeout_read(std::time::Duration::from_secs(5))
+            .timeout_write(std::time::Duration::from_secs(5))
+            .user_agent("abraxas/4.0 (weather color temp daemon)")
             .build()
     })
 }

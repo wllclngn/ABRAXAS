@@ -29,10 +29,13 @@ constexpr int TEMP_UPDATE_SEC     = 60;    /* 1 minute   */
 
 /* Transition windows (minutes) */
 constexpr int DAWN_DURATION = 90;
-constexpr int DUSK_DURATION = 120;
+constexpr int DUSK_DURATION = 180;
+
+/* Dusk offset: shift sigmoid midpoint this many minutes before sunset */
+constexpr int DUSK_OFFSET = 30;
 
 /* Sigmoid steepness for transitions */
-constexpr double SIGMOID_STEEPNESS = 6.0;
+constexpr double SIGMOID_STEEPNESS = 8.0;
 
 /* Path buffer size */
 #define ABRAXAS_PATH_MAX 512
@@ -44,6 +47,7 @@ typedef struct {
     char cache_file[ABRAXAS_PATH_MAX];     /* ~/.config/abraxas/weather_cache.json */
     char override_file[ABRAXAS_PATH_MAX];  /* ~/.config/abraxas/override.json */
     char zipdb_file[ABRAXAS_PATH_MAX];     /* ~/.config/abraxas/us_zipcodes.bin */
+    char pid_file[ABRAXAS_PATH_MAX];       /* ~/.config/abraxas/daemon.pid */
 } abraxas_paths_t;
 
 /* Geographic location */

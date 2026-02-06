@@ -5,10 +5,13 @@
  * JSON override and weather cache parsed via json.h, written via fprintf.
  */
 
+#define _GNU_SOURCE
+
 #include "config.h"
 #include "json.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +36,7 @@ bool config_init_paths(abraxas_paths_t *paths)
     snprintf(paths->cache_file,    sizeof(paths->cache_file),    "%s/weather_cache.json", dir);
     snprintf(paths->override_file, sizeof(paths->override_file), "%s/override.json",      dir);
     snprintf(paths->zipdb_file,    sizeof(paths->zipdb_file),    "%s/us_zipcodes.bin",    dir);
+    snprintf(paths->pid_file,      sizeof(paths->pid_file),      "%s/daemon.pid",         dir);
 #pragma GCC diagnostic pop
 
     /* Create config directory if it doesn't exist */
@@ -293,6 +297,36 @@ bool config_save_weather_cache(const abraxas_paths_t *paths, const weather_data_
 
     fclose(f);
     return true;
+}
+
+bool config_check_daemon_alive(const abraxas_paths_t *paths)
+{
+    FILE *f = fopen(paths->pid_file, "r");
+    if (!f) return false;
+
+    char buf[32];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
+    fclose(f);
+
+    char *end;
+    long pid = strtol(buf, &end, 10);
+    if (end == buf || pid <= 0) return false;
+
+    return kill((pid_t)pid, 0) == 0;
+}
+
+bool config_write_pid(const abraxas_paths_t *paths)
+{
+    FILE *f = fopen(paths->pid_file, "w");
+    if (!f) return false;
+    fprintf(f, "%d\n", (int)getpid());
+    fclose(f);
+    return true;
+}
+
+void config_remove_pid(const abraxas_paths_t *paths)
+{
+    unlink(paths->pid_file);
 }
 
 bool config_weather_needs_refresh(const weather_data_t *wd)

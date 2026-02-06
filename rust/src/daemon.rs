@@ -93,7 +93,7 @@ fn setup_inotify(paths: &Paths) -> i32 {
         libc::inotify_add_watch(
             fd,
             dir_cstr.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_MODIFY,
+            libc::IN_CLOSE_WRITE,
         )
     };
     if wd < 0 {
@@ -197,7 +197,6 @@ fn parse_inotify_events(buf: &[u8], paths: &Paths, result: &mut EventResult) {
     // Extract known filenames from paths
     let override_name = paths.override_file.file_name().and_then(|n| n.to_str()).unwrap_or("override.json");
     let config_name = paths.config_file.file_name().and_then(|n| n.to_str()).unwrap_or("config.ini");
-    let cache_name = paths.cache_file.file_name().and_then(|n| n.to_str()).unwrap_or("weather_cache.json");
 
     // inotify_event layout: i32 wd, u32 mask, u32 cookie, u32 len, [u8] name
     const EVENT_HEADER_SIZE: usize = 16; // sizeof(inotify_event) without name
@@ -222,13 +221,30 @@ fn parse_inotify_events(buf: &[u8], paths: &Paths, result: &mut EventResult) {
                 if name == override_name {
                     result.override_changed = true;
                 }
-                if name == config_name || name == cache_name {
+                if name == config_name {
                     result.config_changed = true;
                 }
             }
         }
 
         offset += event_size;
+    }
+}
+
+struct LocalTime {
+    hour: i32,
+    min: i32,
+    sec: i32,
+}
+
+fn local_time(epoch: i64) -> LocalTime {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = epoch as libc::time_t;
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    LocalTime {
+        hour: tm.tm_hour,
+        min: tm.tm_min,
+        sec: tm.tm_sec,
     }
 }
 
@@ -276,7 +292,7 @@ pub fn run(location: Location, paths: &Paths) {
 
     let mut state = DaemonState {
         location,
-        paths: config::Paths::init().expect("paths already validated"),
+        paths: paths.clone(),
         weather,
         gamma: gamma_state,
         manual_mode: false,
@@ -294,6 +310,11 @@ pub fn run(location: Location, paths: &Paths) {
     let timer_fd = setup_timerfd(TEMP_UPDATE_SEC);
     let ino_fd = setup_inotify(&state.paths);
     let signal_fd = setup_signalfd();
+
+    // Write PID file
+    if let Err(e) = config::write_pid(&state.paths) {
+        eprintln!("[warn] Failed to write PID file: {}", e);
+    }
 
     eprintln!(
         "[abraxas] daemon started (backend: {}, timerfd: {}, inotify: {}, signalfd: {})",
@@ -331,6 +352,7 @@ pub fn run(location: Location, paths: &Paths) {
     if let Some(ref mut g) = state.gamma {
         let _ = g.restore();
     }
+    config::remove_pid(&state.paths);
 
     if timer_fd >= 0 { unsafe { libc::close(timer_fd) }; }
     if ino_fd >= 0 { unsafe { libc::close(ino_fd) }; }
@@ -407,7 +429,7 @@ fn tick(state: &mut DaemonState, event: &EventResult) {
                     state.manual_mode = true;
                     state.manual_target_temp = o.target_temp;
                     state.manual_duration_min = o.duration_minutes;
-                    state.manual_start_time = now;
+                    state.manual_start_time = o.issued_at;
                     state.manual_issued_at = o.issued_at;
                     state.manual_start_temp = if state.last_temp_valid {
                         state.last_temp
@@ -507,6 +529,32 @@ fn tick(state: &mut DaemonState, event: &EventResult) {
 
     // Apply if changed
     if !state.last_temp_valid || target_temp != state.last_temp {
+        let lt = local_time(now);
+
+        if state.manual_mode {
+            let elapsed_min = (now - state.manual_start_time) as f64 / 60.0;
+            if elapsed_min < state.manual_duration_min as f64 {
+                let pct = (elapsed_min / state.manual_duration_min as f64 * 100.0) as i32;
+                let pct = pct.min(100);
+                eprintln!(
+                    "[{:02}:{:02}:{:02}] Manual: {}K ({}%)",
+                    lt.hour, lt.min, lt.sec, target_temp, pct
+                );
+            } else {
+                eprintln!(
+                    "[{:02}:{:02}:{:02}] Manual: {}K (holding)",
+                    lt.hour, lt.min, lt.sec, target_temp
+                );
+            }
+        } else {
+            let sp = solar::position(now, state.location.lat, state.location.lon);
+            let cloud_cover = state.weather.as_ref().map(|w| w.cloud_cover).unwrap_or(0);
+            eprintln!(
+                "[{:02}:{:02}:{:02}] Solar: {}K (sun: {:.1}, clouds: {}%)",
+                lt.hour, lt.min, lt.sec, target_temp, sp.elevation, cloud_cover
+            );
+        }
+
         if let Some(ref mut g) = state.gamma {
             if g.set_temperature(target_temp, 1.0).is_ok() {
                 state.last_temp = target_temp;

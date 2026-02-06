@@ -118,21 +118,26 @@ pub fn init() -> Result<GammaState, Error> {
 ///
 /// Detection order: Wayland > GNOME > DRM > X11
 pub fn init_card(card_num: i32) -> Result<GammaState, Error> {
-    // 1. Try Wayland (wlr-gamma-control)
+    // 1. Try Wayland (wlr-gamma-control) -- only if WAYLAND_DISPLAY is set
     #[cfg(feature = "wayland")]
     {
-        match wayland::WaylandState::init() {
-            Ok(state) => {
-                let usable = (0..state.crtc_count())
-                    .filter(|&i| state.gamma_size(i) > 0)
-                    .count();
-                if usable > 0 {
-                    return Ok(GammaState {
-                        backend: Backend::Wayland(state),
-                    });
+        if std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false) {
+            match wayland::WaylandState::init() {
+                Ok(state) => {
+                    let usable = (0..state.crtc_count())
+                        .filter(|&i| state.gamma_size(i) > 0)
+                        .count();
+                    if usable > 0 {
+                        return Ok(GammaState {
+                            backend: Backend::Wayland(state),
+                        });
+                    }
+                    eprintln!("[gamma] wayland: connected but 0 usable CRTCs");
                 }
+                Err(e) => eprintln!("[gamma] wayland: {}", e),
             }
-            Err(_) => {}
+        } else {
+            eprintln!("[gamma] wayland: skipped (WAYLAND_DISPLAY not set)");
         }
     }
 
@@ -146,8 +151,9 @@ pub fn init_card(card_num: i32) -> Result<GammaState, Error> {
                         backend: Backend::Gnome(state),
                     });
                 }
+                eprintln!("[gamma] gnome: connected but 0 CRTCs");
             }
-            Err(_) => {}
+            Err(e) => eprintln!("[gamma] gnome: {}", e),
         }
     }
 
@@ -162,8 +168,9 @@ pub fn init_card(card_num: i32) -> Result<GammaState, Error> {
                     backend: Backend::Drm(state),
                 });
             }
+            eprintln!("[gamma] drm: opened card{} but 0 usable CRTCs (compositor owns gamma?)", card_num);
         }
-        Err(_) => {}
+        Err(e) => eprintln!("[gamma] drm: {}", e),
     }
 
     // 4. Try X11 (RandR)
@@ -179,8 +186,9 @@ pub fn init_card(card_num: i32) -> Result<GammaState, Error> {
                         backend: Backend::X11(state),
                     });
                 }
+                eprintln!("[gamma] x11: connected but 0 usable CRTCs");
             }
-            Err(_) => {}
+            Err(e) => eprintln!("[gamma] x11: {}", e),
         }
     }
 

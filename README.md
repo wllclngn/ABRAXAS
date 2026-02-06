@@ -6,7 +6,7 @@ A daemon that smoothly adjusts your screen's color temperature throughout the da
 
 ### Solar Grayline Engine
 - **Worldwide Usage**: Offline sunrise/sunset from Jean Meeus algorithms -- pure trig, no network call, any latitude/longitude
-- **Sigmoid Transitions**: Normalized sigmoid over 90-min dawn and 120-min dusk windows, imperceptible at both ends
+- **Sigmoid Transitions**: Normalized sigmoid over 90-min dawn and 180-min dusk windows (front-loaded 30 min before sunset, k=8), imperceptible at both ends
 - **Endpoint Normalization**: Exact [0, 1] output over [-1, 1] domain -- no residual drift at target temperatures
 - **Weather Awareness (US, optional)**: NOAA api.weather.gov cloud cover shifts daytime target (6500K clear, 4500K overcast). See [Build & Install](#build--install) for international builds
 - **Manual Override**: `--set TEMP MINUTES` with the same sigmoid curve, auto-resumes at next transition window
@@ -14,14 +14,17 @@ A daemon that smoothly adjusts your screen's color temperature throughout the da
 ### libmeridian (Gamma Control)
 - **4 Backends**: Wayland (wlr-gamma-control), GNOME (Mutter DBus), DRM (kernel ioctl), X11 (RandR)
 - **Auto-Detection**: Runtime probe based on `$WAYLAND_DISPLAY`, compositor availability, DRM access
+- **Per-Backend Diagnostics**: Each backend logs why it succeeded or failed during probe
 - **Statically Linked**: Single 75K binary, no .so install, no RPATH, no ctypes
 - **Blackbody Ramp**: Planckian locus approximation, 1000K-25000K
 
-### Kernel Event Loop
+### Daemon Reliability
+- **PID File Liveness**: Daemon writes PID on start, CLI commands check liveness before reporting success
 - **Instant Startup**: Gamma applied before curl/SSL init -- screen is correct on first frame
 - **timerfd**: 60-second update ticks (no `sleep()` drift)
-- **inotify**: Config file hot-reload, override detection
-- **signalfd**: Clean SIGTERM/SIGINT shutdown via `select()`
+- **inotify**: Config file hot-reload via IN_CLOSE_WRITE (no spurious partial-write triggers)
+- **signalfd**: Clean SIGTERM/SIGINT shutdown via `select()`/`poll()`
+- **Temperature Logging**: Every tick logs current mode, temperature, sun position, and cloud cover to stderr
 - **Zero Polling**: CPU usage ~180ms over 3 hours
 
 ### C23
@@ -39,7 +42,7 @@ A daemon that smoothly adjusts your screen's color temperature throughout the da
 | Automatic day/night transitions | Manual via `-t` | Cron-based | Built-in sigmoid transitions |
 | Sun position calculation | Via geoclue/manual | External | Built-in NOAA ephemeris |
 | Weather awareness | No | No | Yes (NOAA api.weather.gov) |
-| Smooth transitions | Step function (instant) | N/A | Normalized sigmoid over 90-120 min windows |
+| Smooth transitions | Step function (instant) | N/A | Front-loaded sigmoid over 90-180 min windows |
 | Manual override with gradient | No (`-O` is instant) | No | `--set TEMP MINUTES` |
 | Cloud cover dark mode | No | No | Yes (75% threshold) |
 | DRM kernel gamma | No (X11 only) | No | Yes (direct ioctl) |
@@ -50,22 +53,43 @@ A daemon that smoothly adjusts your screen's color temperature throughout the da
 
 ## MAIN EVENT: C23 vs. Rust
 
-Both implementations produce the same `abraxas` binary, same CLI interface, same config files, same systemd service. Pick at install time.
+Both implementations produce the same `abraxas` binary, same CLI interface, same config files, same systemd service. Pick at install time. Run `./test.py` for a head-to-head comparison across every subsystem.
+
+### Implementation
 
 |                  | C23                | Rust               |
 |------------------|--------------------|--------------------|
 | Compiler         | GCC 14 (-std=c2x)  | rustc 1.75+        |
-| Binary size      | ~75 KB             | ~2.6 MB            |
-| Source LOC       | ~5,100             | ~2,900             |
+| Source LOC       | ~5,100             | ~3,100             |
 | Memory model     | manual alloc/free  | ownership/borrow   |
 | Gamma: DRM       | raw ioctl          | raw ioctl          |
 | Gamma: Wayland   | libwayland-client  | wayland-client     |
-| Gamma: X11       | libX11 + libXrandr | x11rb              |
+| Gamma: X11       | libX11 + libXrandr | x11rb (pure Rust)  |
 | Gamma: GNOME     | libsystemd/sd-bus  | libsystemd/sd-bus  |
-| Weather          | libcurl            | ureq               |
+| Weather          | libcurl (5s timeout)| ureq (5s timeout)  |
 | Config parse     | hand-rolled JSON   | serde_json         |
 | CLI args         | getopt_long        | hand-rolled        |
-| Timer/signals    | timerfd + signalfd | thread::sleep      |
+| Timer/signals    | timerfd + signalfd | timerfd + signalfd |
+| Event loop       | select() on 3 fds  | poll() on 3 fds    |
+| Steady-state     | 2 syscalls/tick    | 2 syscalls/tick    |
+| Heap allocs/tick | 0                  | 0                  |
+| Default backends | auto (pkg-config)  | noaa + x11 (cargo) |
+
+### Measured Performance (test.py, 2026-02-06)
+
+|                     | C23          | Rust          | Notes                          |
+|---------------------|--------------|---------------|--------------------------------|
+| Binary size         | 74 KB        | 2.4 MB        | C23 dynamic (36 libs), Rust static (4 libs) |
+| Startup (--help)    | 3.9 ms       | 0.8 ms        | Rust wins: no dynamic linker overhead |
+| --status            | 5.6 ms       | 1.0 ms        | Rust wins: same reason          |
+| --set               | 4.0 ms       | 0.9 ms        | Rust wins: same reason          |
+| Daemon RSS          | ~14 MB       | ~14 MB        | Dominated by shared lib mappings |
+| Daemon threads      | 1            | 1             |                                |
+| Daemon FDs          | 7            | 7             | stdin/out/err + timerfd + inotify + signalfd + gamma |
+| CPU / hour          | < 1s         | < 1s          | Nearly all time in poll()/select() |
+| Weather timeout     | 5s per req   | 5s per req    | Max 10s blocking (2 NOAA reqs) |
+
+Both implementations achieve near-zero steady-state cost. The daemon sleeps in the kernel between 60-second ticks. CLI commands are sub-millisecond for Rust (static linking avoids ld.so overhead) and under 6ms for C23.
 
 ## Architecture
 
@@ -74,6 +98,7 @@ ABRAXAS/
   c23/              C23 implementation
   rust/             Rust implementation
   install.py        Installer (prompts C23 or Rust)
+  test.py           Head-to-head test suite (68 tests)
   abraxas.service   Systemd user service
   us_zipcodes.bin   ZIP code database (shared)
 ```
@@ -111,7 +136,7 @@ abraxas (Rust, single binary -- all backends compiled in via cargo features)
             +-- Wayland backend: wayland-client + wayland-protocols-wlr
             +-- GNOME backend: raw sd-bus FFI (same as C23)
             +-- DRM backend: raw kernel ioctl (same as C23)
-            +-- X11 backend: x11rb (pure Rust X11 protocol)
+            +-- X11 backend: x11rb (pure Rust X11 protocol, default feature)
 ```
 
 ## Sigmoid Transitions
@@ -130,15 +155,16 @@ A linear ramp has constant rate, which produces visible start and stop artifacts
 
 ```
   Temp (K)
-  6500 |         ___________
-       |        /                          <- sigmoid (dusk)
-       |       /
-       |      |
-  4700 |     |
+  6500 |            ___________
+       |           /                          <- sigmoid (dusk)
+       |          /
+       |        |
+  4700 |       |
+       |      /
        |    /
        |___/
   2900 |_________________________________________
-       sunset-60   sunset    sunset+60     Time
+       sunset-90   sunset    sunset+90     Time
 
   6500 |__________
        |          |                        <- step function
@@ -148,10 +174,10 @@ A linear ramp has constant rate, which produces visible start and stop artifacts
        |          |
        |          |_________________________
   2900 |_________________________________________
-       sunset-60   sunset    sunset+60     Time
+       sunset-90   sunset    sunset+90     Time
 ```
 
-**Dusk** (canonical): 120-minute window centered on sunset. `x` sweeps `+1` to `-1`, mapping day temp through the sigmoid to night temp. **Dawn** (inverse): 90-minute window centered on sunrise. `x` sweeps `-1` to `+1`. Same function, reversed direction.
+**Dusk** (canonical): 180-minute window, front-loaded 30 minutes before sunset (runs from sunset-120min to sunset+60min). The sigmoid midpoint hits at sunset-30min, so the steep k=8 drop happens during golden hour -- by sunset you're already at ~3200K. **Dawn** (inverse): 90-minute window centered on sunrise. `x` sweeps `-1` to `+1`. Same function, no offset.
 
 **Manual overrides** use the same curve. `abraxas --set 3500 30` maps [0, 30 min] to [-1, 1] and interpolates between current temperature and 3500K.
 
@@ -166,13 +192,13 @@ When `--set TEMP MINUTES` is called, the daemon enters manual mode:
 3. After reaching the target, the daemon holds until the next natural transition point (e.g., 15 minutes before the next sunrise)
 4. At that point, the flag clears and solar-based control resumes
 
-The manual call communicates with the running daemon via a control file (watched by inotify). The daemon itself drives the gamma -- no second process.
+The manual call communicates with the running daemon via a control file (watched by inotify via IN_CLOSE_WRITE). The daemon itself drives the gamma -- no second process. If the daemon is not running, the CLI warns the user that the override was saved but won't apply until the daemon starts.
 
 ## Weather Awareness
 
 Every 15 minutes, ABRAXAS fetches the hourly forecast from `api.weather.gov` (NOAA, US only). If cloud cover exceeds 75%, daytime temperature drops from 6500K to 4500K ("dark mode"). This prevents eye strain on overcast days when the ambient light is already dim.
 
-The weather API requires no API key. Rate limits are generous (per User-Agent).
+The weather API requires no API key. Rate limits are generous (per User-Agent). Each request has a 5-second timeout (max 10s for both NOAA requests combined).
 
 ## Installation
 
@@ -186,7 +212,7 @@ pacman -S gcc make pkg-config
 pacman -S rustup && rustup default stable
 
 # Optional: NOAA weather (US users)
-pacman -S curl                          # C23 only; Rust uses reqwest crate
+pacman -S curl                          # C23 only; Rust uses ureq crate
 
 # Optional: Wayland backend
 pacman -S wayland wayland-protocols
@@ -198,7 +224,7 @@ pacman -S systemd-libs
 pacman -S libx11 libxrandr
 ```
 
-All backends are optional and auto-detected at build time.
+All backends are optional and auto-detected at build time. Rust defaults include NOAA and X11 (pure Rust x11rb, no system libs needed).
 
 ### Build & Install
 
@@ -222,7 +248,7 @@ mkdir -p ~/.local/bin ~/.config/abraxas
 cp c23/abraxas ~/.local/bin/
 
 # Or manually (Rust):
-cd rust && cargo build --release --features noaa,wayland,x11,gnome
+cd rust && cargo build --release        # Defaults: noaa + x11
 cp target/release/abraxas ~/.local/bin/
 ```
 
@@ -308,11 +334,12 @@ All config lives in `~/.config/abraxas/`:
 | `config.ini` | Location (latitude/longitude) |
 | `weather_cache.json` | Cached NOAA forecast |
 | `override.json` | Manual override state (daemon-managed) |
+| `daemon.pid` | PID file for liveness checks |
 | `us_zipcodes.bin` | ZIP code database (33k entries, 429 KB) |
 
 ### Tuning
 
-Edit the constants in `include/abraxas.h` and rebuild:
+Edit the constants in `include/abraxas.h` (C23) or `src/main.rs` (Rust) and rebuild:
 
 ```c
 constexpr int TEMP_DAY_CLEAR = 6500;    // Clear sky daytime temperature (K)
@@ -321,6 +348,10 @@ constexpr int TEMP_NIGHT     = 2900;    // Night temperature (K)
 constexpr int CLOUD_THRESHOLD = 75;     // Cloud cover % to trigger dark mode
 constexpr int WEATHER_REFRESH_SEC = 900; // 15 minutes
 constexpr int TEMP_UPDATE_SEC = 60;
+constexpr int DAWN_DURATION = 90;       // Dawn window (minutes, centered on sunrise)
+constexpr int DUSK_DURATION = 180;      // Dusk window (minutes, total)
+constexpr int DUSK_OFFSET   = 30;       // Shift sigmoid midpoint this many min before sunset
+constexpr double SIGMOID_STEEPNESS = 8.0; // Higher = sharper mid-transition
 ```
 
 ## libmeridian C API

@@ -34,6 +34,7 @@
 
 static void cmd_status(double lat, double lon, const abraxas_paths_t *paths)
 {
+    printf("ABRAXAS v4.0.0 [C23]\n\n");
     printf("Location: %.4f, %.4f\n\n", lat, lon);
 
     time_t now = time(nullptr);
@@ -188,7 +189,11 @@ static int cmd_set_temp(int target_temp, int duration_min,
         printf("Override: -> %dK over %d min (sigmoid)\n", target_temp, duration_min);
     else
         printf("Override: -> %dK (instant)\n", target_temp);
-    printf("Daemon will process on next tick (up to 60s).\n");
+
+    if (config_check_daemon_alive(paths))
+        printf("Daemon will process on next tick (up to 60s).\n");
+    else
+        fprintf(stderr, "[warn] Daemon is not running. Override saved but won't apply until daemon starts.\n");
     return 0;
 }
 
@@ -198,7 +203,11 @@ static int cmd_resume(const abraxas_paths_t *paths)
 {
     override_state_t ovr = { .active = false };
     config_save_override(paths, &ovr);
-    printf("Resume sent. Daemon will return to solar control.\n");
+
+    if (config_check_daemon_alive(paths))
+        printf("Resume sent. Daemon will return to solar control.\n");
+    else
+        fprintf(stderr, "[warn] Daemon is not running. Resume saved but won't apply until daemon starts.\n");
     return 0;
 }
 
@@ -312,6 +321,8 @@ int main(int argc, char **argv)
         return cmd_resume(&paths);
     if (command == CMD_SET_LOC)
         return cmd_set_location(loc_arg, &paths);
+    if (command == CMD_SET_TEMP)
+        return cmd_set_temp(set_temp_val, set_temp_dur, &paths);
 
     /* Remaining commands need location */
     location_t loc = config_load_location(&paths);

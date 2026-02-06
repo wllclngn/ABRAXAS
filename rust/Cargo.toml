@@ -1,6 +1,6 @@
 [package]
 name = "abraxas"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
 description = "Dynamic color temperature daemon with weather awareness"
 
@@ -30,7 +30,7 @@ features = ["randr"]
 optional = true
 
 [features]
-default = ["noaa"]
+default = ["noaa", "x11"]
 noaa = ["ureq"]
 wayland = ["wayland-client", "wayland-protocols-wlr"]
 x11 = ["x11rb"]

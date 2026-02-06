@@ -555,7 +555,7 @@ def cmd_test(args, source_dir: Path) -> bool:
     print("  │ Weather          │ libcurl           │ ureq              │")
     print("  │ Config parse     │ hand-rolled JSON  │ serde_json        │")
     print("  │ CLI args         │ getopt_long       │ hand-rolled       │")
-    print("  │ Timer/signals    │ timerfd+signalfd  │ thread::sleep     │")
+    print("  │ Timer/signals    │ timerfd+signalfd  │ timerfd+signalfd  │")
     print("  └──────────────────┴───────────────────┴───────────────────┘")
 
     # Show actual binary sizes if built

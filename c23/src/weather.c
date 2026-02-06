@@ -65,14 +65,14 @@ static bool http_get(const char *url, response_buf_t *resp)
     if (!curl) return false;
 
     struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "User-Agent: abraxas/1.0 (weather color temp daemon)");
+    headers = curl_slist_append(headers, "User-Agent: abraxas/4.0 (weather color temp daemon)");
     headers = curl_slist_append(headers, "Accept: application/geo+json");
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
-    constexpr long CURL_TIMEOUT_SEC = 10L;
+    constexpr long CURL_TIMEOUT_SEC = 5L;
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, CURL_TIMEOUT_SEC);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 

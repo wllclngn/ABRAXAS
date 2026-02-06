@@ -38,4 +38,13 @@ bool config_save_weather_cache(const abraxas_paths_t *paths, const weather_data_
 /* Check if weather cache needs refresh. */
 bool config_weather_needs_refresh(const weather_data_t *wd);
 
+/* Check if daemon process is alive via PID file. */
+bool config_check_daemon_alive(const abraxas_paths_t *paths);
+
+/* Write daemon PID to PID file. */
+bool config_write_pid(const abraxas_paths_t *paths);
+
+/* Remove daemon PID file. */
+void config_remove_pid(const abraxas_paths_t *paths);
+
 #endif /* CONFIG_H */

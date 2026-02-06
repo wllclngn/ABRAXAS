@@ -38,10 +38,13 @@ pub const TEMP_UPDATE_SEC: i64 = 60; // 1 minute
 
 /// Transition windows (minutes)
 pub const DAWN_DURATION: f64 = 90.0;
-pub const DUSK_DURATION: f64 = 120.0;
+pub const DUSK_DURATION: f64 = 180.0;
+
+/// Dusk offset: shift sigmoid midpoint this many minutes before sunset
+pub const DUSK_OFFSET: f64 = 30.0;
 
 /// Sigmoid steepness for transitions
-pub const SIGMOID_STEEPNESS: f64 = 6.0;
+pub const SIGMOID_STEEPNESS: f64 = 8.0;
 
 enum Command {
     Daemon,
@@ -152,6 +155,9 @@ fn main() {
         Command::SetLocation(location) => {
             process::exit(cmd_set_location(location, &paths));
         }
+        Command::Set { temp, duration } => {
+            process::exit(cmd_set_temp(*temp, *duration, &paths));
+        }
         _ => {}
     }
 
@@ -187,6 +193,7 @@ fn main() {
 }
 
 fn cmd_status(lat: f64, lon: f64, paths: &config::Paths) {
+    println!("ABRAXAS v4.0.0 [Rust]\n");
     println!("Location: {:.4}, {:.4}\n", lat, lon);
 
     let now = chrono_now();
@@ -358,7 +365,12 @@ fn cmd_set_temp(target_temp: i32, duration_min: i32, paths: &config::Paths) -> i
     } else {
         println!("Override: -> {}K (instant)", target_temp);
     }
-    println!("Daemon will process on next tick (up to 60s).");
+
+    if config::check_daemon_alive(paths) {
+        println!("Daemon will process on next tick (up to 60s).");
+    } else {
+        eprintln!("[warn] Daemon is not running. Override saved but won't apply until daemon starts.");
+    }
     0
 }
 
@@ -371,7 +383,12 @@ fn cmd_resume(paths: &config::Paths) {
         start_temp: 0,
     };
     let _ = config::save_override(paths, &ovr);
-    println!("Resume sent. Daemon will return to solar control.");
+
+    if config::check_daemon_alive(paths) {
+        println!("Resume sent. Daemon will return to solar control.");
+    } else {
+        eprintln!("[warn] Daemon is not running. Resume saved but won't apply until daemon starts.");
+    }
 }
 
 fn cmd_reset(paths: &config::Paths) {

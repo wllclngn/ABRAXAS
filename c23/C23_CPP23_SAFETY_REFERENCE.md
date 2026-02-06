@@ -7,7 +7,12 @@ Comprehensive guide to catching bugs at compile-time, runtime, and with tooling.
 ## Table of Contents
 
 1. [Compile-Time Safety](#compile-time-safety)
+   - Attributes, Static Assertions, Type Safety, Pointer Qualifiers, Compiler Flags
+   - Checked Arithmetic, Bit Manipulation, `_Generic`, `unreachable()`
+   - `[[reproducible]]`/`[[unsequenced]]`, `_Atomic`, Binary Literals
+   - Compatibility Layer Pattern
 2. [Runtime Crash Handling](#runtime-crash-handling)
+   - Fatal Signal Handlers, Operational Signal Architecture (Flag-Based)
 3. [Memory Safety Tools](#memory-safety-tools)
 4. [Static Analysis](#static-analysis)
 5. [Quick Reference](#quick-reference)
@@ -223,26 +228,401 @@ CFLAGS += -Wall -Wextra -Wpedantic
 
 ### Recommended
 ```makefile
-CFLAGS += -Wshadow -Wconversion -Wcast-qual -Wformat=2
+CFLAGS += -Wshadow -Wconversion -Wsign-conversion -Wcast-qual -Wformat=2
+CFLAGS += -Wformat-security -Wnull-dereference -Warray-bounds=2
+CFLAGS += -Wdouble-promotion -Wrestrict -Wcast-align
 ```
 - `-Wshadow` — variable shadows outer scope
 - `-Wconversion` — implicit type conversions
+- `-Wsign-conversion` — implicit signed/unsigned conversions
 - `-Wcast-qual` — casting away const/volatile
 - `-Wformat=2` — printf/scanf format string checks
+- `-Wformat-security` — format strings that could be security holes
+- `-Wnull-dereference` — paths that dereference null pointers
+- `-Warray-bounds=2` — strict out-of-bounds array access detection
+- `-Wdouble-promotion` — implicit float-to-double promotion (perf trap)
+- `-Wrestrict` — violations of restrict pointer contracts
+- `-Wcast-align` — casts that increase alignment requirements
+
+### Security Hardening
+```makefile
+CFLAGS  += -fstack-protector-strong -fstack-clash-protection -fcf-protection
+CFLAGS  += -D_FORTIFY_SOURCE=3   # Release only (requires -O1+)
+LDFLAGS += -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+```
+- `-fstack-protector-strong` — canary on functions with local arrays or address-taken vars
+- `-fstack-clash-protection` — probe stack pages to prevent clash attacks
+- `-fcf-protection` — hardware-assisted control-flow integrity (Intel CET)
+- `-D_FORTIFY_SOURCE=3` — bounds-checked libc wrappers (memcpy, sprintf, etc.)
+- `-Wl,-z,relro` — read-only relocations (GOT hardening)
+- `-Wl,-z,now` — full RELRO, resolve all symbols at load time
+- `-Wl,-z,noexecstack` — mark stack non-executable
 
 ### For CI/Release
 ```makefile
-CFLAGS += -Werror
+CFLAGS += -Werror -pedantic-errors
 ```
 - `-Werror` — treat warnings as errors
+- `-pedantic-errors` — strict ISO violations are errors, not warnings
 
-### Full Example
+### Full Example (Makefile)
 ```makefile
 CFLAGS := -std=c2x -O2 -march=native -fPIC
 CFLAGS += -Wall -Wextra -Wpedantic
-CFLAGS += -Wshadow -Wconversion -Wcast-qual -Wformat=2
+CFLAGS += -Wshadow -Wconversion -Wsign-conversion -Wcast-qual -Wformat=2
+CFLAGS += -Wformat-security -Wnull-dereference -Wdouble-promotion -Wrestrict
+CFLAGS += -fstack-protector-strong -fstack-clash-protection -fcf-protection
+LDFLAGS += -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 # CFLAGS += -Werror  # Enable for CI
 ```
+
+### Full Example (CMake)
+```cmake
+set(CMAKE_C_STANDARD 23)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+target_compile_options(${TARGET} PRIVATE
+    -Wall -Wextra -Wpedantic
+    -Wformat=2 -Wformat-security -Wnull-dereference -Warray-bounds=2
+    -Wconversion -Wsign-conversion -Wshadow -Wdouble-promotion -Wrestrict -Wcast-align
+    -fstack-protector-strong -fstack-clash-protection -fcf-protection
+    $<$<CONFIG:Release>:-O3 -march=native -D_FORTIFY_SOURCE=3>
+    $<$<CONFIG:Debug>:-O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer -Werror>
+)
+target_link_options(${TARGET} PRIVATE
+    -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    $<$<CONFIG:Debug>:-fsanitize=address,undefined>
+)
+```
+
+---
+
+## Checked Integer Arithmetic (`<stdckdint.h>`)
+
+C23 standardizes overflow-safe arithmetic. Returns `true` on overflow, stores result in
+first argument. Prevents silent wraparound bugs in buffer size calculations.
+
+```c
+#include <stdckdint.h>
+
+size_t alloc_size;
+if (ckd_mul(&alloc_size, count, sizeof(struct item))) {
+    // Overflow: count * sizeof(struct item) exceeds SIZE_MAX
+    return -ENOMEM;
+}
+if (ckd_add(&alloc_size, alloc_size, header_size)) {
+    return -ENOMEM;
+}
+void *buf = malloc(alloc_size);  // Safe
+```
+
+### Fallback for Pre-C23
+
+GCC 5+ and Clang 3.8+ provide `__builtin_*_overflow`:
+
+```c
+#if __has_include(<stdckdint.h>)
+#include <stdckdint.h>
+#else
+#define ckd_add(result, a, b) __builtin_add_overflow((a), (b), (result))
+#define ckd_sub(result, a, b) __builtin_sub_overflow((a), (b), (result))
+#define ckd_mul(result, a, b) __builtin_mul_overflow((a), (b), (result))
+#endif
+```
+
+**Use cases:**
+- Buffer allocation: `count * element_size`
+- Array indexing: `base + offset`
+- Any arithmetic near `SIZE_MAX` or `INT_MAX` boundaries
+
+---
+
+## Bit Manipulation (`<stdbit.h>`)
+
+C23 standardizes common bit operations. Replaces hand-rolled or GCC-specific builtins.
+
+```c
+#include <stdbit.h>
+
+unsigned int x = 0xFF00;
+stdc_count_ones_ui(x);       // 8 (population count)
+stdc_leading_zeros_ui(x);    // 16
+stdc_trailing_zeros_ui(x);   // 8
+stdc_has_single_bit_ui(x);   // false (not power of 2)
+stdc_bit_width_ui(x);        // 16 (minimum bits needed)
+stdc_bit_ceil_ui(x);         // 0x10000 (next power of 2)
+stdc_bit_floor_ui(x);        // 0x8000 (prev power of 2)
+```
+
+### Fallback for Pre-C23
+
+```c
+#if __has_include(<stdbit.h>)
+#include <stdbit.h>
+#else
+#define stdc_count_ones_ui(x)     ((unsigned)__builtin_popcount(x))
+#define stdc_leading_zeros_ui(x)  ((x) ? (unsigned)__builtin_clz(x) : 32u)
+#define stdc_trailing_zeros_ui(x) ((x) ? (unsigned)__builtin_ctz(x) : 32u)
+#define stdc_has_single_bit_ui(x) ((x) != 0 && ((x) & ((x) - 1)) == 0)
+#endif
+```
+
+**Use cases:**
+- Hash table sizing (next power of 2)
+- Flag/bitfield manipulation
+- Efficient lookup table indexing
+
+---
+
+## `_Generic` Type-Safe Macros
+
+C11/C23 `_Generic` enables type-dispatched macros -- safer than untyped `#define`.
+
+### Type-Safe Min/Max (No Double Evaluation)
+
+```c
+static inline int    min_int(int a, int b)       { return a < b ? a : b; }
+static inline long   min_long(long a, long b)    { return a < b ? a : b; }
+static inline size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
+
+#define SAFE_MIN(a, b) _Generic((a), \
+    int:    min_int,    \
+    long:   min_long,   \
+    size_t: min_size    \
+)(a, b)
+
+size_t n = SAFE_MIN(buffer_len, max_read);  // Dispatches to min_size
+int x = SAFE_MIN(3, 5);                     // Dispatches to min_int
+```
+
+### Type-Safe Swap
+
+```c
+#define SAFE_SWAP(a, b) do {   \
+    typeof(a) _tmp = (a);      \
+    (a) = (b);                 \
+    (b) = _tmp;                \
+} while (0)
+```
+
+**Why not `(a) < (b) ? (a) : (b)`:**
+- Double evaluation: `MIN(i++, j++)` increments twice
+- Type mismatch: `MIN(signed_int, unsigned_size_t)` silently promotes
+- `_Generic` catches type mismatches at compile-time
+
+---
+
+## `unreachable()` (C23)
+
+Optimization hint for code paths that cannot execute. Defined in `<stddef.h>`.
+Undefined behavior if reached -- the compiler can assume it never happens.
+
+```c
+#include <stddef.h>
+
+enum direction { NORTH, SOUTH, EAST, WEST };
+
+const char *dir_name(enum direction d) {
+    switch (d) {
+    case NORTH: return "north";
+    case SOUTH: return "south";
+    case EAST:  return "east";
+    case WEST:  return "west";
+    }
+    unreachable();  // Compiler knows all cases covered, eliminates "missing return" warning
+}
+```
+
+### Fallback
+
+```c
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L
+#define unreachable() __builtin_unreachable()  // GCC/Clang
+#endif
+```
+
+---
+
+## `[[reproducible]]` and `[[unsequenced]]` (C23)
+
+New function attributes for pure/const function optimization hints.
+
+```c
+// [[reproducible]] = same inputs -> same output (may read global state)
+// Equivalent to GCC __attribute__((pure))
+[[reproducible]] int string_length(const char *s);
+
+// [[unsequenced]] = same inputs -> same output, NO side effects, NO global reads
+// Equivalent to GCC __attribute__((const))
+[[unsequenced]] int square(int x);
+```
+
+### Fallback
+
+```c
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#define REPRODUCIBLE [[reproducible]]
+#define UNSEQUENCED  [[unsequenced]]
+#elif defined(__GNUC__)
+#define REPRODUCIBLE __attribute__((pure))
+#define UNSEQUENCED  __attribute__((const))
+#else
+#define REPRODUCIBLE
+#define UNSEQUENCED
+#endif
+```
+
+**Use on:** Character classification, hash functions, math helpers, lookup functions.
+
+---
+
+## `_Atomic` Types (C11/C23)
+
+For data shared between signal handlers and main code, or between threads.
+Stronger than `volatile` -- provides actual memory ordering guarantees.
+
+```c
+#include <stdatomic.h>
+
+struct terminal {
+    _Atomic short t_nrow;   // Updated by SIGWINCH handler
+    _Atomic short t_ncol;   // Read by display code
+};
+
+// Signal handler (async-signal-safe with atomics)
+void handle_winch(int sig) {
+    (void)sig;
+    atomic_store(&term.t_nrow, new_rows);
+    atomic_store(&term.t_ncol, new_cols);
+}
+
+// Main loop
+void update_display(void) {
+    short rows = atomic_load(&term.t_nrow);
+    // ...
+}
+```
+
+### `volatile sig_atomic_t` vs `_Atomic`
+
+| Feature | `volatile sig_atomic_t` | `_Atomic` |
+|---------|------------------------|-----------|
+| Signal-safe | Yes | Yes (for lock-free types) |
+| Thread-safe | **No** | Yes |
+| Memory ordering | None | Configurable |
+| Type | Integer only | Any lock-free type |
+
+**Rule:** Use `volatile sig_atomic_t` for simple signal flags. Use `_Atomic` for
+struct fields that need concurrent read/write safety (signal handlers + main loop,
+or multithreaded access).
+
+---
+
+## Binary Literals (C23)
+
+Direct binary notation for bit patterns. Clearer than hex for flags, masks, control codes.
+
+```c
+#define CFCPCN  0b0000000000000001   // Last command was C-P, C-N
+#define CFKILL  0b0000000000000010   // Last command was a kill
+#define CFYANK  0b0000000000000100   // Last command was a yank
+
+#define BELL    0b00000111U          // ASCII BEL
+#define TAB     0b00001001U          // ASCII HT
+```
+
+---
+
+## Compatibility Layer Pattern
+
+Real projects need to support both C23 and older compilers. Use a `c23_compat.h`
+header with macro wrappers:
+
+```c
+/* c23_compat.h - C23 features with pre-C23 fallbacks */
+#ifndef C23_COMPAT_H
+#define C23_COMPAT_H
+
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 202311L
+#define HAVE_C23 1
+#endif
+#endif
+#ifndef HAVE_C23
+#define HAVE_C23 0
+#endif
+
+/* constexpr */
+#if HAVE_C23
+#define CONSTEXPR constexpr
+#else
+#define CONSTEXPR static const
+#endif
+
+/* [[nodiscard]] */
+#if HAVE_C23 || defined(__GNUC__)
+#define NODISCARD [[nodiscard]]
+#define NODISCARD_MSG(msg) [[nodiscard(msg)]]
+#else
+#define NODISCARD
+#define NODISCARD_MSG(msg)
+#endif
+
+/* [[noreturn]] */
+#if HAVE_C23
+#define NORETURN [[noreturn]]
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define NORETURN _Noreturn
+#elif defined(__GNUC__)
+#define NORETURN __attribute__((noreturn))
+#else
+#define NORETURN
+#endif
+
+/* nullptr */
+#if !HAVE_C23 && !defined(__cplusplus)
+#ifndef nullptr
+#define nullptr ((void*)0)
+#endif
+#endif
+
+/* unreachable() */
+#if !HAVE_C23
+#if defined(__GNUC__)
+#define unreachable() __builtin_unreachable()
+#else
+#define unreachable() do {} while (0)
+#endif
+#endif
+
+/* static_assert (C11 fallback) */
+#if !HAVE_C23 && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define static_assert _Static_assert
+#endif
+
+/* Checked arithmetic */
+#if HAVE_C23 && __has_include(<stdckdint.h>)
+#include <stdckdint.h>
+#elif defined(__GNUC__) && __GNUC__ >= 5
+#define ckd_add(r, a, b) __builtin_add_overflow((a), (b), (r))
+#define ckd_sub(r, a, b) __builtin_sub_overflow((a), (b), (r))
+#define ckd_mul(r, a, b) __builtin_mul_overflow((a), (b), (r))
+#endif
+
+#endif /* C23_COMPAT_H */
+```
+
+**Usage:**
+```c
+#include "c23_compat.h"
+
+CONSTEXPR int BUFFER_SIZE = 4096;
+NODISCARD int parse_config(const char *path);
+NORETURN void fatal(const char *msg);
+```
+
+This pattern lets you write C23-idiomatic code today while maintaining compatibility.
 
 ---
 
@@ -346,10 +726,105 @@ void install_crash_handler() {
 ### Async-Signal-Safety
 
 Only use async-signal-safe functions in handlers:
-- `write()`, `_exit()`, `signal()`
-- **NOT safe:** `printf()`, `malloc()`, `new`, most of libc
+- `write()`, `_exit()`, `signal()`, `tcsetattr()`
+- **NOT safe:** `printf()`, `malloc()`, `free()`, `new`, most of libc
 
 `dprintf(fd, ...)` is safe. `fprintf(stderr, ...)` is not.
+
+---
+
+## Operational Signal Architecture (Flag-Based)
+
+The crash handler pattern above is for fatal signals only. For operational signals
+(SIGWINCH, SIGINT, SIGHUP, SIGTERM, SIGCONT), use the flag-based pattern:
+handlers set flags, main loop does real work.
+
+### The Pattern
+
+```c
+#include <signal.h>
+#include <stdatomic.h>
+#include <termios.h>
+#include <unistd.h>
+
+/* Global signal flags -- only these are touched in handlers */
+volatile sig_atomic_t sig_winch_pending = 0;
+volatile sig_atomic_t sig_int_pending   = 0;
+volatile sig_atomic_t sig_term_pending  = 0;
+
+/* Saved terminal state for async-signal-safe restoration */
+static struct termios saved_termios;
+static bool termios_saved = false;
+
+/* Handlers ONLY set flags -- no real work */
+static void handle_winch(int sig) { (void)sig; sig_winch_pending = 1; }
+static void handle_int(int sig)   { (void)sig; sig_int_pending = 1; }
+
+static void handle_term(int sig) {
+    (void)sig;
+    sig_term_pending = 1;
+    /* Terminal restoration is async-signal-safe (only write + tcsetattr) */
+    restore_terminal_safe();
+}
+
+/* Async-signal-safe terminal restoration */
+static void restore_terminal_safe(void) {
+    static const char reset[] = "\033[0m\033[?1049l\033[?25h";
+    (void)write(STDOUT_FILENO, reset, sizeof(reset) - 1);
+    if (termios_saved)
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+}
+
+void signal_handlers_init(void) {
+    struct sigaction sa = {0};
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;  /* Restart interrupted read()/write() */
+
+    sa.sa_handler = handle_winch;
+    sigaction(SIGWINCH, &sa, NULL);
+
+    sa.sa_handler = handle_int;
+    sigaction(SIGINT, &sa, NULL);
+
+    sa.sa_handler = handle_term;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+}
+```
+
+### Main Loop Checks Flags
+
+```c
+void main_loop(void) {
+    while (running) {
+        /* Check signals first */
+        if (sig_term_pending) {
+            save_modified_buffers();
+            break;
+        }
+        if (sig_winch_pending) {
+            sig_winch_pending = 0;
+            handle_resize();  /* Safe: runs in main context */
+        }
+        if (sig_int_pending) {
+            sig_int_pending = 0;
+            cancel_current_operation();
+        }
+
+        /* Normal event processing */
+        process_input();
+    }
+}
+```
+
+### `SA_RESTART` vs `SA_RESETHAND`
+
+| Flag | Use Case |
+|------|----------|
+| `SA_RESTART` | Operational signals (SIGWINCH, SIGINT). Auto-restarts interrupted `read()`/`write()` so the main loop doesn't need `EINTR` handling everywhere. |
+| `SA_RESETHAND` | Crash signals (SIGSEGV, SIGABRT). One-shot: handler fires once, then resets to default. Prevents recursive crashes. |
+
+**Rule:** Use `SA_RESTART` for signals you handle and continue. Use `SA_RESETHAND` for signals that will terminate the process.
 
 ---
 
@@ -729,12 +1204,20 @@ use(x);
 | `[[maybe_unused]]` | Suppress unused warning | Debug functions |
 | `[[deprecated]]` | Mark old API | Legacy functions |
 | `[[noreturn]]` | Never returns | exit(), fatal() |
+| `[[fallthrough]]` | Intentional switch fallthrough | Complex parsers |
+| `[[reproducible]]` | Pure function hint | String length |
+| `[[unsequenced]]` | Const function hint | Math helpers |
 | `static_assert` | Compile-time check | Struct sizes |
 | `nullptr` | Type-safe null | Pointer init |
 | `constexpr` | Compile-time constant | Lookup tables |
-| `consteval` | Must be compile-time | Forced const eval |
+| `consteval` | Must be compile-time (C++) | Forced const eval |
 | `const` | Read-only data | Function params |
 | `restrict` | No aliasing promise | Optimization |
+| `unreachable()` | Dead code hint | Exhaustive switch |
+| `ckd_add/sub/mul` | Overflow-safe arithmetic | Buffer allocation |
+| `_Generic` | Type-dispatched macros | Safe min/max |
+| `_Atomic` | Signal/thread-safe fields | Terminal state |
+| `0b` literals | Binary notation | Flags, masks |
 
 ## Sanitizers
 
@@ -763,7 +1246,13 @@ valgrind --leak-check=full ./program
 - [ ] Lookup tables are `constexpr`
 - [ ] Read-only parameters are `const`
 - [ ] Non-overlapping buffers use `restrict`
+- [ ] Buffer arithmetic uses `ckd_add`/`ckd_mul` (not raw `*`/`+`)
+- [ ] Pure functions annotated `[[reproducible]]`/`[[unsequenced]]`
+- [ ] Exhaustive switches end with `unreachable()`
+- [ ] Signal-shared fields use `_Atomic` or `volatile sig_atomic_t`
 - [ ] Building with `-Wall -Wextra -Wpedantic`
+- [ ] Building with security hardening (`-fstack-protector-strong`, RELRO, etc.)
+- [ ] Compatibility layer (`c23_compat.h`) if supporting pre-C23 compilers
 
 ## Before Release
 
@@ -772,17 +1261,30 @@ valgrind --leak-check=full ./program
 - [ ] No leaks in LSan/Valgrind
 - [ ] Multithreaded code tested with TSan
 - [ ] Static analysis clean (clang-tidy, cppcheck)
+- [ ] Signal handlers are async-signal-safe (only set flags)
+- [ ] Terminal restoration works on SIGTERM/SIGHUP (no printf in handlers)
 
 ## CI Pipeline
 
 ```makefile
 # Debug build with sanitizers
 debug:
-    $(CXX) -std=c++23 -g -O1 \
+    $(CC) -std=c2x -g -O1 \
         -fsanitize=address,undefined \
         -fno-omit-frame-pointer \
         -Wall -Wextra -Wpedantic -Werror \
+        -Wconversion -Wsign-conversion -Wshadow -Wformat=2 \
+        -fstack-protector-strong \
         $(SOURCES) -o $(TARGET)
+
+# Release build with hardening
+release:
+    $(CC) -std=c2x -O3 -march=native \
+        -Wall -Wextra -Wpedantic \
+        -fstack-protector-strong -fstack-clash-protection -fcf-protection \
+        -D_FORTIFY_SOURCE=3 \
+        $(SOURCES) -o $(TARGET) \
+        -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s
 
 # Static analysis
 lint:
