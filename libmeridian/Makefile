@@ -82,9 +82,14 @@ OBJECTS  := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SOURCES))
 OBJECTS  += $(WL_PROTO_O)
 TARGET   := libmeridian.so
 
-.PHONY: all clean install test info
+.PHONY: all static clean install test info
 
 all: info $(BUILDDIR) $(TARGET)
+
+static: info $(BUILDDIR) libmeridian.a
+
+libmeridian.a: $(OBJECTS)
+	ar rcs $@ $^
 
 info:
 	@echo "Building libmeridian.so"
@@ -127,7 +132,7 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(INCDIR)/meridian.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -rf $(BUILDDIR) $(TARGET)
+	rm -rf $(BUILDDIR) $(TARGET) libmeridian.a
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) /usr/local/lib/$(TARGET)

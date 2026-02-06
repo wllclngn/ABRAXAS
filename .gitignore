@@ -1,12 +1,15 @@
+# Compiled binary
+/abraxas
+
 # Build directories and artifacts
-libmeridian/build/
-libmeridian/build-*/
+build/
+libmeridian/build*/
 libmeridian/libmeridian.so
+libmeridian/libmeridian.a
 
 # Compile artifacts
 *.o
 *.so
-*.a
 
 # Python
 __pycache__/

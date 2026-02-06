@@ -25,18 +25,19 @@ Unlike redshift, which requires an external scheduler or manual `-O` calls, ABRA
 | Dependencies | geoclue, X11 | cron, redshift | libc, libm (all backends optional) |
 | Scheduler needed | Yes | Is the scheduler | No |
 
-ABRAXAS is a single binary + shared library. No cron jobs, no geoclue, no dbus.
+ABRAXAS is a single statically-linked binary. No cron jobs, no geoclue, no dbus, no shared libraries to install.
 
 ## Architecture
 
 ```
-abraxas (Python daemon)
+abraxas (C23, single binary -- libmeridian statically linked)
     |
     +-- NOAA sun ephemeris (offline calculation)
     +-- Weather from api.weather.gov (15-min refresh)
     +-- Sigmoid transition engine
+    +-- Custom RFC 8259 JSON parser (no vendored code)
     |
-    +-- libmeridian.so (C23)
+    +-- libmeridian.a (C23, statically linked)
             |
             +-- Wayland backend: wlr-gamma-control protocol
             |   (Sway, Hyprland, river, labwc, wayfire, niri)
@@ -63,7 +64,7 @@ CPU usage is ~180ms over 3 hours. The daemon is effectively invisible.
 
 ### libmeridian
 
-A C23 shared library providing direct gamma ramp control. Four backends, all auto-detected at build time via pkg-config:
+A C23 library providing direct gamma ramp control, statically linked into the daemon. Four backends, all auto-detected at build time via pkg-config:
 
 - **Wayland** (preferred on Wayland): Uses the `wlr-gamma-control-unstable-v1` protocol via `wayland-client`. Covers Sway, Hyprland, river, labwc, wayfire, niri. Protocol XML shipped in-tree.
 
@@ -155,19 +156,18 @@ pacman -S systemd-libs
 pacman -S libx11 libxrandr
 ```
 
-No runtime dependencies beyond libc and libm. Python 3.10+ for the daemon. All backends are optional and auto-detected at build time.
+No runtime dependencies beyond libc, libm, and libcurl. All backends are optional and auto-detected at build time.
 
 ### Build & Install
 
 ```bash
-# Automated installer (builds libmeridian, copies files, enables service)
+# Automated installer (builds everything, copies binary, enables service)
 ./install.py
 
 # Or manually:
-cd libmeridian && make
-mkdir -p ~/.local/lib ~/.local/bin ~/.config/abraxas
-cp libmeridian.so ~/.local/lib/
-cp abraxas ~/.local/bin/ && chmod +x ~/.local/bin/abraxas
+make
+mkdir -p ~/.local/bin ~/.config/abraxas
+cp abraxas ~/.local/bin/
 cp us_zipcodes.bin ~/.config/abraxas/
 cp abraxas.service ~/.config/systemd/user/
 systemctl --user daemon-reload
@@ -239,15 +239,15 @@ All config lives in `~/.config/abraxas/`:
 
 ### Tuning
 
-Edit the constants at the top of the `abraxas` script:
+Edit the constants in `include/abraxas.h` and rebuild:
 
-```python
-TEMP_DAY_CLEAR = 6500       # Clear sky daytime temperature (K)
-TEMP_DAY_DARK  = 4500       # Overcast daytime temperature (K)
-TEMP_NIGHT     = 2900       # Night temperature (K)
-CLOUD_THRESHOLD = 75        # Cloud cover % to trigger dark mode
-WEATHER_REFRESH_MINUTES = 15
-TEMP_UPDATE_SECONDS = 60
+```c
+constexpr int TEMP_DAY_CLEAR = 6500;    // Clear sky daytime temperature (K)
+constexpr int TEMP_DAY_DARK  = 4500;    // Overcast daytime temperature (K)
+constexpr int TEMP_NIGHT     = 2900;    // Night temperature (K)
+constexpr int CLOUD_THRESHOLD = 75;     // Cloud cover % to trigger dark mode
+constexpr int WEATHER_REFRESH_SEC = 900; // 15 minutes
+constexpr int TEMP_UPDATE_SEC = 60;
 ```
 
 ## libmeridian C API
@@ -264,9 +264,10 @@ meridian_restore(state);                        // Restore original gamma
 meridian_free(state);                           // Clean up
 ```
 
-Build with:
+Build against the static archive:
 ```bash
-gcc -I/usr/local/include myapp.c -lmeridian -o myapp
+make -C libmeridian static
+gcc -Ilibmeridian/include myapp.c libmeridian/libmeridian.a -lm $(pkg-config --libs ...) -o myapp
 ```
 
 See `libmeridian/include/meridian.h` for the full API.

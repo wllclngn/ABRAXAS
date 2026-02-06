@@ -30,7 +30,6 @@ _real_user = os.environ.get("SUDO_USER", os.environ.get("USER"))
 _real_home = Path(f"/home/{_real_user}") if _real_user else Path.home()
 
 INSTALL_BINARY = _real_home / ".local" / "bin" / "abraxas"
-INSTALL_LIB = _real_home / ".local" / "lib" / "libmeridian.so"
 INSTALL_CONFIG_DIR = _real_home / ".config" / "abraxas"
 INSTALL_SERVICE = _real_home / ".config" / "systemd" / "user" / "abraxas.service"
 
@@ -164,21 +163,16 @@ def restart_service() -> bool:
 # BUILD
 # =============================================================================
 
-def build_libmeridian(source_dir: Path, force: bool = False) -> bool:
-    """Build libmeridian from source."""
-    lib_dir = source_dir / "libmeridian"
-    lib_so = lib_dir / "libmeridian.so"
-
-    if not lib_dir.exists():
-        log_error(f"Library source not found: {lib_dir}")
-        return False
+def build_abraxas(source_dir: Path, force: bool = False) -> bool:
+    """Build abraxas binary (statically links libmeridian)."""
+    binary = source_dir / "abraxas"
 
     # Skip build if already exists (unless forced)
-    if lib_so.exists() and not force:
-        log_info("libmeridian.so already built (use --rebuild to force)")
+    if binary.exists() and not force:
+        log_info("abraxas already built (use --rebuild to force)")
         return True
 
-    log_info("BUILDING LIBMERIDIAN")
+    log_info("BUILDING ABRAXAS")
 
     # Check for make
     ret, _, _ = run_cmd_capture(["which", "make"])
@@ -192,19 +186,19 @@ def build_libmeridian(source_dir: Path, force: bool = False) -> bool:
         log_error("gcc not found. Install build tools: sudo pacman -S base-devel")
         return False
 
-    # Build
-    ret = run_cmd(["make", "-C", str(lib_dir), "clean"])
-    ret = run_cmd(["make", "-C", str(lib_dir)])
+    # Build (top-level make builds libmeridian.a then daemon)
+    ret = run_cmd(["make", "-C", str(source_dir), "clean"])
+    ret = run_cmd(["make", "-C", str(source_dir)])
 
     if ret != 0:
         log_error("Build failed!")
         return False
 
-    if not lib_so.exists():
-        log_error("Build completed but libmeridian.so not found")
+    if not binary.exists():
+        log_error("Build completed but abraxas binary not found")
         return False
 
-    log_info(f"Built: {lib_so}")
+    log_info(f"Built: {binary}")
     return True
 
 
@@ -217,24 +211,16 @@ def cmd_install(args, source_dir: Path) -> bool:
     log_info("INSTALLING ABRAXAS")
 
     source_binary = source_dir / "abraxas"
-    source_lib_dir = source_dir / "libmeridian"
-    source_lib = source_lib_dir / "libmeridian.so"
     source_service = source_dir / "abraxas.service"
     source_zipdb = source_dir / "us_zipcodes.bin"
 
-    # Check source files exist
-    if not source_binary.exists():
-        log_error(f"Binary not found: {source_binary}")
-        return False
-
-    # Build libmeridian if needed
-    if not build_libmeridian(source_dir, force=args.rebuild):
+    # Build if needed
+    if not build_abraxas(source_dir, force=args.rebuild):
         return False
 
     # Create directories
     log_info("Creating directories...")
     INSTALL_BINARY.parent.mkdir(parents=True, exist_ok=True)
-    INSTALL_LIB.parent.mkdir(parents=True, exist_ok=True)
     INSTALL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     INSTALL_SERVICE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -242,11 +228,6 @@ def cmd_install(args, source_dir: Path) -> bool:
     log_info(f"Installing {INSTALL_BINARY}...")
     shutil.copy2(source_binary, INSTALL_BINARY)
     INSTALL_BINARY.chmod(0o755)
-
-    # Copy library
-    log_info(f"Installing {INSTALL_LIB}...")
-    shutil.copy2(source_lib, INSTALL_LIB)
-    INSTALL_LIB.chmod(0o755)
 
     # Copy ZIP database
     if source_zipdb.exists():
@@ -275,7 +256,6 @@ def cmd_install(args, source_dir: Path) -> bool:
         gid = int(subprocess.run(["id", "-g", _real_user], capture_output=True, text=True).stdout.strip())
 
         os.chown(INSTALL_BINARY, uid, gid)
-        os.chown(INSTALL_LIB, uid, gid)
         os.chown(INSTALL_SERVICE, uid, gid)
 
         for f in INSTALL_CONFIG_DIR.iterdir():
@@ -284,7 +264,6 @@ def cmd_install(args, source_dir: Path) -> bool:
     print()
     log_info("SUCCESS. Installation complete.")
     log_info(f"Binary: {INSTALL_BINARY}")
-    log_info(f"Library: {INSTALL_LIB}")
 
     # Offer to enable service
     if not args.no_service and INSTALL_SERVICE.exists():
@@ -310,7 +289,6 @@ def cmd_uninstall(args, source_dir: Path) -> bool:
 
     files = [
         INSTALL_BINARY,
-        INSTALL_LIB,
         INSTALL_SERVICE,
     ]
 
@@ -340,16 +318,12 @@ def cmd_status(args, source_dir: Path) -> bool:
 
     # Check installation
     binary_ok = INSTALL_BINARY.exists()
-    lib_ok = INSTALL_LIB.exists()
     service_ok = INSTALL_SERVICE.exists()
     config_ok = INSTALL_CONFIG_DIR.exists()
     zipdb_ok = (INSTALL_CONFIG_DIR / "us_zipcodes.bin").exists()
 
     print(f"  Binary:    {INSTALL_BINARY}")
     print(f"             {'installed' if binary_ok else 'NOT INSTALLED'}")
-    print()
-    print(f"  Library:   {INSTALL_LIB}")
-    print(f"             {'installed' if lib_ok else 'NOT INSTALLED'}")
     print()
     print(f"  Service:   {INSTALL_SERVICE}")
     print(f"             {'installed' if service_ok else 'NOT INSTALLED'}")
@@ -374,10 +348,9 @@ def cmd_status(args, source_dir: Path) -> bool:
     print(f"  X11 fallback: {'available' if x11_ok else 'not available (install libx11 libxrandr)'}")
     print()
 
-    installed = binary_ok and lib_ok
-    print(f"  Overall: {'INSTALLED' if installed else 'NOT INSTALLED'}")
+    print(f"  Overall: {'INSTALLED' if binary_ok else 'NOT INSTALLED'}")
 
-    return installed
+    return binary_ok
 
 
 def cmd_enable(args, source_dir: Path) -> bool:
@@ -398,71 +371,47 @@ def cmd_update(args, source_dir: Path) -> bool:
     """Update abraxas if source is newer."""
     log_info("CHECKING FOR UPDATES")
 
-    source_binary = source_dir / "abraxas"
-    source_lib_dir = source_dir / "libmeridian"
-    source_lib = source_lib_dir / "libmeridian.so"
-
-    if not source_binary.exists():
-        log_error(f"Source binary not found: {source_binary}")
-        return False
-
-    if not source_lib_dir.exists():
-        log_error(f"Library source not found: {source_lib_dir}")
-        return False
-
-    needs_update = False
     needs_rebuild = False
 
-    # Check binary
+    # Check if any source files are newer than installed binary
     if INSTALL_BINARY.exists():
-        if source_binary.stat().st_mtime > INSTALL_BINARY.stat().st_mtime:
-            needs_update = True
-            log_info("Binary: update available")
-        else:
-            log_info("Binary: up to date")
+        installed_mtime = INSTALL_BINARY.stat().st_mtime
+
+        # Check daemon sources
+        for pattern in ["src/*.[ch]", "include/*.[ch]", "libmeridian/src/*.[ch]",
+                        "libmeridian/include/*.[ch]"]:
+            for src_file in source_dir.glob(pattern):
+                if src_file.stat().st_mtime > installed_mtime:
+                    needs_rebuild = True
+                    log_info(f"Source updated: {src_file.name}")
+                    break
+            if needs_rebuild:
+                break
+
+        if not needs_rebuild:
+            log_info("Already up to date")
+            return True
     else:
-        needs_update = True
+        needs_rebuild = True
         log_info("Binary: not installed")
 
-    # Check library source files for changes
-    if INSTALL_LIB.exists():
-        installed_mtime = INSTALL_LIB.stat().st_mtime
-        for src_file in source_lib_dir.rglob("*.[ch]"):
-            if src_file.stat().st_mtime > installed_mtime:
-                needs_rebuild = True
-                needs_update = True
-                log_info("Library: source updated, rebuild needed")
-                break
-        if not needs_rebuild:
-            log_info("Library: up to date")
-    else:
-        needs_update = True
-        needs_rebuild = True
-        log_info("Library: not installed")
+    # Rebuild
+    if not build_abraxas(source_dir, force=True):
+        return False
 
-    if needs_update:
-        # Rebuild library if source changed
-        if needs_rebuild or not source_lib.exists():
-            if not build_libmeridian(source_dir, force=True):
-                return False
+    source_binary = source_dir / "abraxas"
+    log_info("Installing updates...")
+    shutil.copy2(source_binary, INSTALL_BINARY)
+    INSTALL_BINARY.chmod(0o755)
 
-        log_info("Installing updates...")
-        shutil.copy2(source_binary, INSTALL_BINARY)
-        INSTALL_BINARY.chmod(0o755)
-        shutil.copy2(source_lib, INSTALL_LIB)
-        INSTALL_LIB.chmod(0o755)
+    # Fix ownership if running as root
+    if os.environ.get("SUDO_USER"):
+        uid = int(subprocess.run(["id", "-u", _real_user], capture_output=True, text=True).stdout.strip())
+        gid = int(subprocess.run(["id", "-g", _real_user], capture_output=True, text=True).stdout.strip())
+        os.chown(INSTALL_BINARY, uid, gid)
 
-        # Fix ownership if running as root
-        if os.environ.get("SUDO_USER"):
-            uid = int(subprocess.run(["id", "-u", _real_user], capture_output=True, text=True).stdout.strip())
-            gid = int(subprocess.run(["id", "-g", _real_user], capture_output=True, text=True).stdout.strip())
-            os.chown(INSTALL_BINARY, uid, gid)
-            os.chown(INSTALL_LIB, uid, gid)
-
-        restart_service()
-        log_info("Update complete")
-    else:
-        log_info("Already up to date")
+    restart_service()
+    log_info("Update complete")
 
     return True
 

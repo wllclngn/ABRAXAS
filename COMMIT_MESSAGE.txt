@@ -1,0 +1,52 @@
+ABRAXASv2.0.0:
+
+Complete rewrite of daemon from Python to C23. Single statically-linked binary replaces
+1148-line Python script + ctypes + .so install. Zero vendored code.
+
+DAEMON (C23, 2373 LOC -- 2069 src + 304 headers):
+- Replaces Python daemon entirely -- same features, native performance, 75K binary
+- Custom RFC 8259 JSON parser (json.c, 482 LOC): recursive descent, tagged union,
+  json_path() dot-navigation for clean NOAA API parsing, [[nodiscard]] on all fallible calls
+- NOAA sun position (solar.c): Julian day, equation of time, solar declination, hour angle
+- Sigmoid transitions (sigmoid.c): exact [0,1] over [-1,1], dawn inverse of dusk
+- Weather client (weather.c): libcurl HTTP, two-step NOAA API, cloud cover keyword heuristic
+- Config (config.c): hand-rolled INI parser, JSON override/cache via json.h, fprintf for writes
+- ZIP lookup (zipdb.c): mmap'd binary search on packed 13-byte entries, static_assert(sizeof(float)==4)
+- Event loop (daemon.c): timerfd + inotify + signalfd + select(), zero polling
+- CLI (main.c): getopt_long, --daemon/--status/--set-location/--refresh/--set/--resume/--reset
+- Statically links libmeridian.a -- no .so install, no RPATH, no ctypes, single binary
+- C23 throughout: constexpr, nullptr, [[nodiscard]], static_assert, designated initializers, native bool
+
+BUILD SYSTEM:
+- Top-level Makefile: builds libmeridian.a (static target) then links daemon
+- gcc -std=c2x -O2 -march=native -Wall -Wextra -Wpedantic -- zero warnings
+- Backend libs auto-detected via pkg-config (same as libmeridian)
+
+INSTALLER (install.py):
+- Removed INSTALL_LIB / .so handling (no longer needed -- statically linked)
+- build_libmeridian() replaced with build_abraxas() using top-level make
+- cmd_update() checks src/*.c + include/*.h + libmeridian source mtimes
+- cmd_status() / cmd_uninstall() simplified (no library status)
+
+CHANGES:
+- include/abraxas.h (NEW)
+- include/json.h (NEW)
+- include/solar.h (NEW)
+- include/sigmoid.h (NEW)
+- include/zipdb.h (NEW)
+- include/config.h (NEW)
+- include/weather.h (NEW)
+- include/daemon.h (NEW)
+- src/main.c (NEW)
+- src/json.c (NEW)
+- src/solar.c (NEW)
+- src/sigmoid.c (NEW)
+- src/zipdb.c (NEW)
+- src/config.c (NEW)
+- src/weather.c (NEW)
+- src/daemon.c (NEW)
+- Makefile (NEW)
+- .gitignore (MOD)
+- install.py (MOD)
+- libmeridian/Makefile (MOD -- added static target)
+- abraxas (DELETED -- old Python daemon, replaced by compiled binary)
