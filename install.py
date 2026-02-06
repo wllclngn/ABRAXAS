@@ -163,7 +163,8 @@ def restart_service() -> bool:
 # BUILD
 # =============================================================================
 
-def build_abraxas(source_dir: Path, force: bool = False) -> bool:
+def build_abraxas(source_dir: Path, force: bool = False,
+                  non_usa: bool = False) -> bool:
     """Build abraxas binary (statically links libmeridian)."""
     binary = source_dir / "abraxas"
 
@@ -172,7 +173,10 @@ def build_abraxas(source_dir: Path, force: bool = False) -> bool:
         log_info("abraxas already built (use --rebuild to force)")
         return True
 
-    log_info("BUILDING ABRAXAS")
+    if non_usa:
+        log_info("BUILDING ABRAXAS (non-USA: weather disabled)")
+    else:
+        log_info("BUILDING ABRAXAS")
 
     # Check for make
     ret, _, _ = run_cmd_capture(["which", "make"])
@@ -187,8 +191,11 @@ def build_abraxas(source_dir: Path, force: bool = False) -> bool:
         return False
 
     # Build (top-level make builds libmeridian.a then daemon)
-    ret = run_cmd(["make", "-C", str(source_dir), "clean"])
-    ret = run_cmd(["make", "-C", str(source_dir)])
+    make_cmd = ["make", "-C", str(source_dir)]
+    if non_usa:
+        make_cmd.append("NOAA=0")
+    ret = run_cmd(make_cmd + ["clean"])
+    ret = run_cmd(make_cmd)
 
     if ret != 0:
         log_error("Build failed!")
@@ -214,8 +221,27 @@ def cmd_install(args, source_dir: Path) -> bool:
     source_service = source_dir / "abraxas.service"
     source_zipdb = source_dir / "us_zipcodes.bin"
 
-    # Build if needed
-    if not build_abraxas(source_dir, force=args.rebuild):
+    # Determine NOAA mode: --non-usa flag overrides, otherwise prompt
+    if args.non_usa:
+        non_usa = True
+    else:
+        print()
+        while True:
+            response = input(
+                "ABRAXAS allows for utilization of US-specific NOAA data\n"
+                "for weather calculations. Do you wish to enable NOAA\n"
+                "data calculations? [Y/N]: "
+            ).strip()
+            if response in ("y", "Y"):
+                non_usa = False
+                break
+            elif response in ("n", "N"):
+                non_usa = True
+                break
+        print()
+
+    # Build (always force -- user just chose NOAA config)
+    if not build_abraxas(source_dir, force=True, non_usa=non_usa):
         return False
 
     # Create directories
@@ -224,24 +250,28 @@ def cmd_install(args, source_dir: Path) -> bool:
     INSTALL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     INSTALL_SERVICE.parent.mkdir(parents=True, exist_ok=True)
 
-    # Stop service before overwriting running binary
+    # Stop running abraxas before overwriting binary (ETXTBSY)
     subprocess.run(["systemctl", "--user", "stop", "abraxas"], capture_output=True)
+    subprocess.run(["pkill", "-x", "abraxas"], capture_output=True)
 
     # Copy binary
     log_info(f"Installing {INSTALL_BINARY}...")
     shutil.copy2(source_binary, INSTALL_BINARY)
     INSTALL_BINARY.chmod(0o755)
 
-    # Copy ZIP database
-    if source_zipdb.exists():
-        dest_zipdb = INSTALL_CONFIG_DIR / "us_zipcodes.bin"
-        if not dest_zipdb.exists():
-            log_info("Installing ZIP database...")
-            shutil.copy2(source_zipdb, dest_zipdb)
+    # Copy ZIP database (skip for non-USA builds)
+    if not non_usa:
+        if source_zipdb.exists():
+            dest_zipdb = INSTALL_CONFIG_DIR / "us_zipcodes.bin"
+            if not dest_zipdb.exists():
+                log_info("Installing ZIP database...")
+                shutil.copy2(source_zipdb, dest_zipdb)
+            else:
+                log_info("ZIP database already installed")
         else:
-            log_info("ZIP database already installed")
+            log_warn("ZIP database not found in source")
     else:
-        log_warn("ZIP database not found in source")
+        log_info("Skipping ZIP database (non-USA build)")
 
     # Copy systemd service
     if source_service.exists():
@@ -272,7 +302,7 @@ def cmd_install(args, source_dir: Path) -> bool:
     if not args.no_service and INSTALL_SERVICE.exists():
         if not is_service_enabled():
             print()
-            response = input("Enable abraxas service? [Y/n]: ").strip().lower()
+            response = input("Enable abraxas service? [Y/N]: ").strip().lower()
             if response in ("", "y", "yes"):
                 enable_service()
         else:
@@ -399,7 +429,8 @@ def cmd_update(args, source_dir: Path) -> bool:
         log_info("Binary: not installed")
 
     # Rebuild
-    if not build_abraxas(source_dir, force=True):
+    non_usa = getattr(args, 'non_usa', False)
+    if not build_abraxas(source_dir, force=True, non_usa=non_usa):
         return False
 
     source_binary = source_dir / "abraxas"
@@ -439,6 +470,7 @@ Commands:
 Examples:
   ./install.py                    # Install and optionally enable service
   ./install.py --no-service       # Install without prompting for service
+  ./install.py --non-usa          # Install without NOAA weather (no libcurl)
   ./install.py status             # Check installation status
   ./install.py enable             # Enable service
   ./install.py uninstall          # Remove installation
@@ -451,7 +483,9 @@ Examples:
     parser.add_argument("--no-service", action="store_true",
                        help="Don't prompt to enable service after install")
     parser.add_argument("--rebuild", action="store_true",
-                       help="Force rebuild of libmeridian even if already built")
+                       help="Force rebuild even if already built")
+    parser.add_argument("--non-usa", action="store_true",
+                       help="Disable NOAA weather (no libcurl dependency)")
 
     args = parser.parse_args()
 

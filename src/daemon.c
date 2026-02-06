@@ -14,7 +14,6 @@
 #include "solar.h"
 #include "weather.h"
 
-#include <curl/curl.h>
 #include <meridian.h>
 
 #include <errno.h>
@@ -166,8 +165,8 @@ void daemon_run(daemon_state_t *state)
     gamma_set(startup_temp);
     printf("[startup] Applied %dK\n", startup_temp);
 
-    /* Init curl now -- after gamma is applied, before event loop needs weather */
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    /* Init weather subsystem (curl) -- after gamma is applied, before event loop */
+    weather_init();
 
     bool running = true;
 
@@ -344,6 +343,7 @@ void daemon_run(daemon_state_t *state)
             }
         }
 
+#ifndef NOAA_DISABLED
         /* Refresh weather if needed */
         if (config_weather_needs_refresh(&state->weather)) {
             struct tm nt;
@@ -359,6 +359,7 @@ void daemon_run(daemon_state_t *state)
             else
                 printf("  Weather fetch failed\n");
         }
+#endif
 
         /* Calculate temperature */
         int temp;
@@ -413,7 +414,7 @@ void daemon_run(daemon_state_t *state)
 
     /* Clean shutdown */
     printf("Shutting down...\n");
-    curl_global_cleanup();
+    weather_cleanup();
     gamma_restore();
     gamma_cleanup();
 

@@ -37,3 +37,6 @@ core
 .clangd/
 .ccls-cache/
 compile_commands.json
+
+# Commit notes
+COMMIT_MESSAGE.txt

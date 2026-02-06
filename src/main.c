@@ -20,7 +20,6 @@
 #include "weather.h"
 #include "zipdb.h"
 
-#include <curl/curl.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,7 +67,7 @@ static void cmd_status(double lat, double lon, const abraxas_paths_t *paths)
                ft.tm_year + 1900, ft.tm_mon + 1, ft.tm_mday,
                ft.tm_hour, ft.tm_min, ft.tm_sec);
     } else {
-        printf("Weather: Not available (run daemon to fetch)\n");
+        printf("Weather: Not available\n");
     }
     printf("\n");
 
@@ -307,7 +306,7 @@ int main(int argc, char **argv)
         cmd_status(loc.lat, loc.lon, &paths);
         break;
     case CMD_REFRESH:
-        curl_global_init(CURL_GLOBAL_DEFAULT);
+        weather_init();
         result = cmd_refresh(loc.lat, loc.lon, &paths);
         break;
     case CMD_SET_TEMP:
@@ -326,6 +325,6 @@ int main(int argc, char **argv)
         break;
     }
 
-    curl_global_cleanup();
+    weather_cleanup();
     return result;
 }

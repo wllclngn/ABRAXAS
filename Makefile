@@ -1,5 +1,7 @@
 # ABRAXAS - Dynamic color temperature daemon
 # Statically links libmeridian.a for a single binary.
+#
+# NOAA=0 disables weather features and drops the libcurl dependency.
 
 CC       := gcc
 CFLAGS   := -std=c2x -O2 -march=native -Wall -Wextra -Wpedantic
@@ -15,8 +17,14 @@ TARGET   := abraxas
 LIBM_DIR := libmeridian
 LIBM_A   := $(LIBM_DIR)/libmeridian.a
 
-# Libraries
-LIBS     := -lcurl -lm
+# NOAA weather support (disable with NOAA=0 for non-US builds)
+NOAA     ?= 1
+LIBS     := -lm
+ifeq ($(NOAA),0)
+    CFLAGS += -DNOAA_DISABLED
+else
+    LIBS   += -lcurl
+endif
 
 # Backend libs from libmeridian's dependencies (same detection)
 WL_AVAILABLE    := $(shell pkg-config --exists wayland-client 2>/dev/null && echo yes || echo no)

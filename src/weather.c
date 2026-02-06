@@ -9,10 +9,17 @@
  *
  * Cloud cover is derived from forecast keyword heuristic (no direct cloud %
  * in the hourly forecast -- NOAA provides probabilityOfPrecipitation instead).
+ *
+ * This file owns the entire NOAA/libcurl lifecycle. No other file includes
+ * <curl/curl.h> or calls curl directly. When NOAA_DISABLED is defined
+ * (non-US builds), all three public functions compile to no-ops/stubs
+ * and libcurl is not linked.
  */
 
 #include "weather.h"
 #include "json.h"
+
+#ifndef NOAA_DISABLED
 
 #include <curl/curl.h>
 #include <stdio.h>
@@ -134,6 +141,16 @@ static int cloud_cover_from_forecast(const char *forecast)
     return 0;
 }
 
+void weather_init(void)
+{
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+}
+
+void weather_cleanup(void)
+{
+    curl_global_cleanup();
+}
+
 weather_data_t weather_fetch(double lat, double lon)
 {
     weather_data_t wd = {
@@ -202,3 +219,30 @@ weather_data_t weather_fetch(double lat, double lon)
     json_free(root);
     return wd;
 }
+
+#else /* NOAA_DISABLED -- non-US build, no libcurl */
+
+#include <string.h>
+#include <time.h>
+
+void weather_init(void)    {}
+void weather_cleanup(void) {}
+
+weather_data_t weather_fetch(double lat, double lon)
+{
+    (void)lat;
+    (void)lon;
+
+    weather_data_t wd = {
+        .cloud_cover = 0,
+        .temperature = 0.0,
+        .is_day = true,
+        .fetched_at = time(nullptr),
+        .has_error = true
+    };
+    strncpy(wd.forecast, "Disabled (non-USA build)", sizeof(wd.forecast) - 1);
+    wd.forecast[sizeof(wd.forecast) - 1] = '\0';
+    return wd;
+}
+
+#endif /* NOAA_DISABLED */

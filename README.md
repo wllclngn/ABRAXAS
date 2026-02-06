@@ -138,8 +138,11 @@ The weather API requires no API key. Rate limits are generous (per User-Agent).
 ### Dependencies
 
 ```bash
-# Required: build tools + libcurl
-pacman -S gcc make pkg-config curl
+# Required: build tools
+pacman -S gcc make pkg-config
+
+# Optional: NOAA weather (US users)
+pacman -S curl
 
 # Optional: Wayland backend (Sway, Hyprland, river, etc.)
 pacman -S wayland wayland-protocols
@@ -151,19 +154,23 @@ pacman -S systemd-libs
 pacman -S libx11 libxrandr
 ```
 
-No runtime dependencies beyond libc, libm, and libcurl. All backends are optional and auto-detected at build time.
+No runtime dependencies beyond libc and libm. libcurl is only required for US weather support. All backends are optional and auto-detected at build time.
 
 ### Build & Install
 
 ```bash
-# Automated installer (builds, copies binary + ZIP db, installs service)
+# Automated installer (prompts for NOAA weather support)
 ./install.py
 
+# Skip prompt -- disable NOAA for non-US locations
+./install.py --non-usa
+
 # Or manually:
-make
+make                    # US build (links libcurl)
+make NOAA=0             # International build (no libcurl)
 mkdir -p ~/.local/bin ~/.config/abraxas
 cp abraxas ~/.local/bin/
-cp us_zipcodes.bin ~/.config/abraxas/
+cp us_zipcodes.bin ~/.config/abraxas/   # US only
 ```
 
 ### Setup
@@ -172,6 +179,10 @@ cp us_zipcodes.bin ~/.config/abraxas/
 # Set location (US ZIP code or lat,lon)
 abraxas --set-location 60614
 abraxas --set-location 41.88,-87.63
+
+# International users: use lat,lon directly
+abraxas --set-location 51.51,-0.13     # London
+abraxas --set-location 48.86,2.35      # Paris
 
 # Verify
 abraxas --status
@@ -288,7 +299,8 @@ See `libmeridian/include/meridian.h` for the full API.
 - **GNOME Wayland**: Mutter DBus gamma control (Debian, Ubuntu, Fedora defaults)
 - **AMD/Intel/Nouveau**: DRM backend (pure kernel, no compositor needed)
 - **NVIDIA proprietary**: X11/RandR fallback (requires X11 libs)
-- **US locations**: Weather via api.weather.gov (NOAA). Non-US locations work for solar calculations but weather features require a US grid point.
+- **International**: Solar calculations work worldwide. Build with `make NOAA=0` or `./install.py --non-usa` to remove the libcurl dependency entirely.
+- **US locations**: NOAA weather awareness via api.weather.gov (cloud cover adjusts daytime temperature). Enabled by default.
 
 ## License
 
