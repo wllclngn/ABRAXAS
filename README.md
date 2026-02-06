@@ -30,7 +30,7 @@ A single-binary C23 daemon that smoothly adjusts your screen's color temperature
 
 ---
 
-## Replacing redshift + redshift-scheduler
+## Modernizing redshift + redshift-scheduler
 
 | Feature | redshift | redshift-scheduler | ABRAXAS |
 |---------|----------|--------------------|---------|
