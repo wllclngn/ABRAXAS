@@ -1,0 +1,36 @@
+# Build directories and artifacts
+libmeridian/build/
+libmeridian/build-*/
+libmeridian/libmeridian.so
+
+# Compile artifacts
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs, cores, temp
+*.log
+*.out
+core
+*.core
+
+# Editor/OS noise
+*~
+*.swp
+*.swo
+\#*\#
+.#*
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+.cache/
+.clangd/
+.ccls-cache/
+compile_commands.json
