@@ -74,9 +74,7 @@ abraxas (C23, single binary -- libmeridian statically linked)
 
 ## Sigmoid Transitions
 
-redshift doesn't transition at all. It holds a day temp and a night temp and lets the user (or a cron scheduler) flip between them. `redshift -O 3500` is an instant hard-cut. redshift-scheduler wraps this with cron jobs that fire at fixed times, still producing step-function jumps between temperatures. Your screen goes from 6500K to 2900K in a single frame.
-
-ABRAXAS uses a normalized sigmoid function for every temperature transition:
+All temperature transitions use a normalized sigmoid function:
 
 ```
             1
@@ -84,20 +82,14 @@ f(x) = -----------        normalized to exactly [0, 1] over x in [-1, 1]
         1 + e^(-kx)
 ```
 
-**Why sigmoid, not linear?** A linear ramp changes temperature at a constant rate. The problem is perceptual: humans notice color shifts most when they start and stop. A linear ramp begins abruptly (you see the shift kick in) and ends abruptly (you see it stop). A sigmoid is the opposite -- it changes slowly at the edges and quickly through the middle. The transition is imperceptible at both ends, with the bulk of the shift happening when your eyes are already adapting. You never notice it start. You never notice it stop. You just look up and the light is different.
+A sigmoid changes slowly at the edges and quickly through the middle. This matches human color perception -- the transition is imperceptible at both ends, with ~80% of the shift happening through the middle third while ambient light is already changing.
 
-**Dusk is the canonical transition.** A 120-minute window is centered on sunset. As the window progresses, `x` sweeps from `+1` (full day) to `-1` (full night) through the sigmoid. At x=+1 the function outputs exactly 1.0 (day temp). At x=0 (sunset) it outputs 0.5 (midpoint). At x=-1 it outputs exactly 0.0 (night temp). The curve is steepest through the middle third -- that's where 80% of the 3600K shift happens, fast enough that it tracks the actual fading light.
-
-**Dawn is the inverse.** Same 90-minute window, centered on sunrise, but `x` sweeps from `-1` (night) to `+1` (day). The sigmoid naturally produces the mirror curve: slow departure from night, rapid climb through mid-tones, slow arrival at day. No special-casing. The math is identical -- only the direction of `x` changes.
-
-**Manual overrides use the same curve.** When you run `abraxas --set 3500 30`, the sigmoid maps [0, 30 minutes] to [-1, 1] and interpolates between your current temperature and 3500K. Same function, same perceptual smoothness, over whatever duration you specify.
-
-**Endpoint normalization.** A raw sigmoid with steepness k=6 outputs 0.0025 at x=-1 and 0.9975 at x=+1 -- close to [0, 1] but not exact. Over a 3600K range that's a 9K error at the boundaries. ABRAXAS normalizes the output to hit exactly 0.0 and 1.0 at the window edges, so the transition arrives precisely at the target temperature with no residual drift.
+A linear ramp has constant rate, which produces visible start and stop artifacts. A step function (the traditional approach) is a single-frame jump.
 
 ```
   Temp (K)
   6500 |         ___________
-       |        /                          <- ABRAXAS sigmoid (dusk)
+       |        /                          <- sigmoid (dusk)
        |       /
        |      |
   4700 |     |
@@ -107,7 +99,7 @@ f(x) = -----------        normalized to exactly [0, 1] over x in [-1, 1]
        sunset-60   sunset    sunset+60     Time
 
   6500 |__________
-       |          |                        <- redshift -O / cron step function
+       |          |                        <- step function
        |          |
        |          |
   4700 |          |
@@ -116,6 +108,12 @@ f(x) = -----------        normalized to exactly [0, 1] over x in [-1, 1]
   2900 |_________________________________________
        sunset-60   sunset    sunset+60     Time
 ```
+
+**Dusk** (canonical): 120-minute window centered on sunset. `x` sweeps `+1` to `-1`, mapping day temp through the sigmoid to night temp. **Dawn** (inverse): 90-minute window centered on sunrise. `x` sweeps `-1` to `+1`. Same function, reversed direction.
+
+**Manual overrides** use the same curve. `abraxas --set 3500 30` maps [0, 30 min] to [-1, 1] and interpolates between current temperature and 3500K.
+
+**Endpoint normalization.** A raw sigmoid with k=6 outputs 0.0025 at x=-1 and 0.9975 at x=+1. Over a 3600K range that's 9K of drift at the boundaries. The output is normalized to hit exact 0.0 and 1.0 at window edges -- no residual error at target temperatures.
 
 ## Manual Override
 
