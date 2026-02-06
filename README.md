@@ -2,8 +2,6 @@
 
 Dynamic color temperature daemon for Linux. Replaces both **redshift** and **redshift-scheduler**.
 
-Named for the Gnostic deity of transformation -- the one who bridges light and dark.
-
 ## What It Does
 
 ABRAXAS adjusts your screen's color temperature throughout the day based on the sun's position at your location. At noon, your display is a cool 6500K. As the sun sets, ABRAXAS smoothly transitions through a sigmoid curve down to a warm 2900K for night. At dawn, it ramps back up.
