@@ -190,7 +190,7 @@ impl FetchState {
                 url,
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()?;
 
         let fd = child.stdout.as_ref()
@@ -226,7 +226,10 @@ impl FetchState {
                 self.phase = FetchPhase::ReadingPoints;
                 fd
             }
-            Err(_) => -1,
+            Err(e) => {
+                eprintln!("  spawn_curl failed: {}", e);
+                -1
+            }
         }
     }
 
@@ -321,6 +324,7 @@ impl FetchState {
                         ReadResult::NewPipe
                     }
                     Err(e) => {
+                        eprintln!("  spawn_curl (forecast) failed: {}", e);
                         self.phase = FetchPhase::Idle;
                         ReadResult::Done(Err(e))
                     }

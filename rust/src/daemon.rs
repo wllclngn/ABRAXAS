@@ -14,16 +14,23 @@ use crate::gamma;
 use crate::uring::{self, AbraxasRing, KernelTimespec};
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const GAMMA_INIT_MAX_RETRIES: i32 = 60;
 const GAMMA_INIT_RETRY_MS: u64 = 500;
 
-/// Event discrimination from inotify
-#[derive(Default)]
-struct EventResult {
-    override_changed: bool,
-    config_changed: bool,
+// Atomic event flag bitmask
+const FLAG_TIMER:    u32 = 1 << 0;
+const FLAG_SIGNAL:   u32 = 1 << 1;
+const FLAG_WEATHER:  u32 = 1 << 2;
+const FLAG_OVERRIDE: u32 = 1 << 3;
+const FLAG_CONFIG:   u32 = 1 << 4;
+
+/// Multi-shot poll liveness tracking
+struct PollState {
+    inotify: bool,
+    signal: bool,
+    weather: bool,
 }
 
 /// Full daemon runtime state
@@ -103,19 +110,16 @@ fn setup_signalfd() -> i32 {
     }
 }
 
-/// Parse inotify event buffer, comparing each event's filename against known
-/// config files. Sets override_changed / config_changed accordingly.
-fn parse_inotify_events(buf: &[u8], paths: &Paths, result: &mut EventResult) {
-    // Extract known filenames from paths
+/// Parse inotify event buffer, returning flag bits for changed files.
+fn parse_inotify_events(buf: &[u8], paths: &Paths) -> u32 {
     let override_name = paths.override_file.file_name().and_then(|n| n.to_str()).unwrap_or("override.json");
     let config_name = paths.config_file.file_name().and_then(|n| n.to_str()).unwrap_or("config.ini");
 
-    // inotify_event layout: i32 wd, u32 mask, u32 cookie, u32 len, [u8] name
-    const EVENT_HEADER_SIZE: usize = 16; // sizeof(inotify_event) without name
+    const EVENT_HEADER_SIZE: usize = 16;
     let mut offset = 0;
+    let mut flags = 0u32;
 
     while offset + EVENT_HEADER_SIZE <= buf.len() {
-        // Read len field (offset 12, u32)
         let name_len = u32::from_ne_bytes([
             buf[offset + 12], buf[offset + 13], buf[offset + 14], buf[offset + 15],
         ]) as usize;
@@ -126,21 +130,21 @@ fn parse_inotify_events(buf: &[u8], paths: &Paths, result: &mut EventResult) {
         }
 
         if name_len > 0 {
-            // Name is null-terminated within the name_len bytes
             let name_bytes = &buf[offset + EVENT_HEADER_SIZE..offset + event_size];
             let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
             if let Ok(name) = std::str::from_utf8(&name_bytes[..name_end]) {
                 if name == override_name {
-                    result.override_changed = true;
+                    flags |= FLAG_OVERRIDE;
                 }
                 if name == config_name {
-                    result.config_changed = true;
+                    flags |= FLAG_CONFIG;
                 }
             }
         }
 
         offset += event_size;
     }
+    flags
 }
 
 struct LocalTime {
@@ -180,7 +184,53 @@ fn solar_temperature(now: i64, lat: f64, lon: f64, weather: &Option<WeatherData>
     sigmoid::calculate_solar_temp(min_from_sunrise, min_to_sunset, is_dark)
 }
 
-/// io_uring event loop: single io_uring_enter per tick.
+/// Read inotify events from fd, returning flag bits.
+fn parse_inotify_fd(fd: i32, paths: &Paths) -> u32 {
+    let mut buf = [0u8; 4096];
+    let len = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if len > 0 {
+        parse_inotify_events(&buf[..len as usize], paths)
+    } else {
+        0
+    }
+}
+
+/// Unified CQE handler -- used by both main drain and cancel drain.
+fn process_cqe(
+    cqe: &uring::IoUringCqe,
+    events: &AtomicU32,
+    polls: &mut PollState,
+    ino_fd: i32,
+    paths: &Paths,
+) {
+    let more = cqe.flags & uring::IORING_CQE_F_MORE != 0;
+    match cqe.user_data {
+        uring::EV_TIMEOUT => {
+            events.fetch_or(FLAG_TIMER, Ordering::Relaxed);
+        }
+        uring::EV_SIGNAL => {
+            events.fetch_or(FLAG_SIGNAL, Ordering::Relaxed);
+            if !more { polls.signal = false; }
+        }
+        uring::EV_INOTIFY => {
+            if cqe.res > 0 {
+                let bits = parse_inotify_fd(ino_fd, paths);
+                events.fetch_or(bits, Ordering::Relaxed);
+            }
+            if !more { polls.inotify = false; }
+        }
+        uring::EV_WEATHER => {
+            if cqe.res > 0 {
+                events.fetch_or(FLAG_WEATHER, Ordering::Relaxed);
+            }
+            if !more { polls.weather = false; }
+        }
+        uring::EV_CANCEL => {}
+        _ => {}
+    }
+}
+
+/// io_uring event loop with multi-shot polls and atomic event flags.
 fn event_loop_uring(
     state: &mut DaemonState,
     ring: &mut AbraxasRing,
@@ -193,18 +243,28 @@ fn event_loop_uring(
     };
 
     let mut wfs = FetchState::new();
+    let mut polls = PollState {
+        inotify: false,
+        signal: false,
+        weather: false,
+    };
 
     loop {
-        // Submit: poll both fds + timeout
-        if ino_fd >= 0 {
+        // Register multi-shot polls only when not alive
+        if ino_fd >= 0 && !polls.inotify {
             ring.prep_poll(ino_fd, uring::EV_INOTIFY);
+            polls.inotify = true;
         }
-        if signal_fd >= 0 {
+        if signal_fd >= 0 && !polls.signal {
             ring.prep_poll(signal_fd, uring::EV_SIGNAL);
+            polls.signal = true;
         }
-        if wfs.needs_poll() {
+        if wfs.needs_poll() && !polls.weather {
             ring.prep_poll(wfs.pipe_fd, uring::EV_WEATHER);
+            polls.weather = true;
         }
+
+        // Fresh timeout each iteration (one-shot)
         ring.prep_timeout(&ts, uring::EV_TIMEOUT);
 
         let ret = ring.submit_and_wait();
@@ -212,42 +272,27 @@ fn event_loop_uring(
             break;
         }
 
-        // Process completions
-        let mut timer_expired = false;
-        let mut got_signal = false;
-        let weather_ready = AtomicBool::new(false);
-        let mut event = EventResult::default();
-
+        // Process all CQEs through unified handler
+        let events = AtomicU32::new(0);
         while let Some(cqe) = ring.peek_cqe() {
-            match cqe.user_data {
-                uring::EV_TIMEOUT => timer_expired = true,
-                uring::EV_SIGNAL => got_signal = true,
-                uring::EV_INOTIFY => {
-                    if cqe.res > 0 {
-                        parse_inotify_fd(ino_fd, &state.paths, &mut event);
-                    }
-                }
-                uring::EV_WEATHER => {
-                    if cqe.res > 0 { weather_ready.store(true, Ordering::Relaxed); }
-                }
-                uring::EV_CANCEL => {}
-                _ => {}
-            }
+            process_cqe(cqe, &events, &mut polls, ino_fd, &state.paths);
             ring.cqe_seen();
         }
 
-        // If we woke early (inotify/signal), cancel the pending timeout
-        if !timer_expired {
+        let mut flags = events.load(Ordering::Relaxed);
+
+        // Cancel timeout if woke early -- drain through same handler
+        if flags & FLAG_TIMER == 0 {
             ring.prep_cancel(uring::EV_TIMEOUT, uring::EV_CANCEL);
             ring.submit_and_wait();
-            // Drain cancel completion
-            while ring.peek_cqe().is_some() {
+            while let Some(cqe) = ring.peek_cqe() {
+                process_cqe(cqe, &events, &mut polls, ino_fd, &state.paths);
                 ring.cqe_seen();
             }
+            flags = events.load(Ordering::Relaxed);
         }
 
-        if got_signal {
-            // Drain signalfd
+        if flags & FLAG_SIGNAL != 0 {
             if signal_fd >= 0 {
                 let mut buf = [0u8; 128];
                 unsafe {
@@ -259,7 +304,7 @@ fn event_loop_uring(
             break;
         }
 
-        tick(state, &event);
+        tick(state, flags & FLAG_OVERRIDE != 0, flags & FLAG_CONFIG != 0);
 
         // Async weather fetch (non-blocking, io_uring integrated)
         #[cfg(feature = "noaa")]
@@ -279,14 +324,18 @@ fn event_loop_uring(
                         lt.hour, lt.min, lt.sec
                     );
                     wfs.start(state.location.lat, state.location.lon);
+                    polls.weather = false; // new pipe_fd needs registration
                 }
             }
 
-            if weather_ready.load(Ordering::Relaxed) {
+            if flags & FLAG_WEATHER != 0 {
                 match wfs.read_response() {
                     ReadResult::Pending => {}
-                    ReadResult::NewPipe => {}
+                    ReadResult::NewPipe => {
+                        polls.weather = false; // new pipe_fd needs registration
+                    }
                     ReadResult::Done(result) => {
+                        polls.weather = false;
                         match result {
                             Ok(wd) => {
                                 let _ = config::save_weather_cache(&state.paths, &wd);
@@ -312,15 +361,6 @@ fn event_loop_uring(
                 }
             }
         }
-    }
-}
-
-/// Read and parse inotify events from fd (used by io_uring path).
-fn parse_inotify_fd(fd: i32, paths: &Paths, result: &mut EventResult) {
-    let mut buf = [0u8; 4096];
-    let len = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if len > 0 {
-        parse_inotify_events(&buf[..len as usize], paths, result);
     }
 }
 
@@ -418,7 +458,7 @@ pub fn run(location: Location, paths: &Paths) {
     recover_override(&mut state);
 
     // Apply gamma immediately at startup (force override check)
-    tick(&mut state, &EventResult { override_changed: true, ..Default::default() });
+    tick(&mut state, true, false);
 
     // Initialize weather subsystem
     weather::init();
@@ -432,7 +472,7 @@ pub fn run(location: Location, paths: &Paths) {
         }
     };
     eprintln!(
-        "[abraxas] daemon started (backend: {}, io_uring: active, inotify: {}, signalfd: {})",
+        "[abraxas] daemon started (backend: {}, io_uring: multi-shot, inotify: {}, signalfd: {})",
         state.gamma.as_ref().map(|g| g.backend_name()).unwrap_or("none"),
         if ino_fd >= 0 { "active" } else { "unavailable" },
         if signal_fd >= 0 { "active" } else { "unavailable" },
@@ -508,11 +548,11 @@ fn recover_override(state: &mut DaemonState) {
     );
 }
 
-fn tick(state: &mut DaemonState, event: &EventResult) {
+fn tick(state: &mut DaemonState, override_changed: bool, config_changed: bool) {
     let now = now_epoch();
 
     // Check for override changes -- ONLY when inotify detected a change
-    if event.override_changed {
+    if override_changed {
         let ovr = config::load_override(&state.paths);
         if let Some(ref o) = ovr {
             if o.active {
@@ -562,7 +602,7 @@ fn tick(state: &mut DaemonState, event: &EventResult) {
     }
 
     // Reload config if inotify detected a config file change
-    if event.config_changed {
+    if config_changed {
         if let Some(new_loc) = config::load_location(&state.paths) {
             state.location = new_loc;
             eprintln!(

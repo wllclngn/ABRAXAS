@@ -27,6 +27,12 @@ const IORING_OP_POLL_ADD: u8 = 6;
 const IORING_OP_TIMEOUT: u8 = 11;
 const IORING_OP_ASYNC_CANCEL: u8 = 14;
 
+// Multi-shot poll (Linux 5.13+) -- sqe.len flag
+const IORING_POLL_ADD_MULTI: u32 = 1 << 0;
+
+// CQE flags
+pub const IORING_CQE_F_MORE: u32 = 1 << 1;
+
 // Event tags
 pub const EV_INOTIFY: u64 = 1;
 pub const EV_SIGNAL: u64 = 2;
@@ -255,12 +261,14 @@ impl AbraxasRing {
         unsafe { *self.sq_tail += 1 };
     }
 
+    /// Multi-shot POLL_ADD: fd stays monitored until closed or cancelled.
     pub fn prep_poll(&mut self, fd: i32, user_data: u64) {
         if let Some(sqe) = self.get_sqe() {
             unsafe {
                 (*sqe).opcode = IORING_OP_POLL_ADD;
                 (*sqe).fd = fd;
-                (*sqe).rw_flags = libc::POLLIN as u32; // poll32_events
+                (*sqe).len = IORING_POLL_ADD_MULTI;
+                (*sqe).rw_flags = libc::POLLIN as u32;
                 (*sqe).user_data = user_data;
             }
             self.commit_sqe();
@@ -273,7 +281,7 @@ impl AbraxasRing {
                 (*sqe).opcode = IORING_OP_TIMEOUT;
                 (*sqe).fd = -1;
                 (*sqe).addr = ts as *const KernelTimespec as u64;
-                (*sqe).len = 1; // complete after 1 timeout or 1 other event
+                (*sqe).len = 1; // 1 timespec entry; event count is sqe.off (0 = pure timeout)
                 (*sqe).user_data = user_data;
             }
             self.commit_sqe();

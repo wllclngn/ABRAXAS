@@ -142,15 +142,17 @@ static void commit_sqe(abraxas_ring_t *ring)
     (*ring->sq_tail)++;
 }
 
+/* Multi-shot POLL_ADD: fd stays monitored until closed or cancelled. */
 void uring_prep_poll(abraxas_ring_t *ring, int fd, uint64_t user_data)
 {
     struct io_uring_sqe *sqe = get_sqe(ring);
     if (!sqe) return;
 
-    sqe->opcode    = IORING_OP_POLL_ADD;
-    sqe->fd        = fd;
+    sqe->opcode        = IORING_OP_POLL_ADD;
+    sqe->fd            = fd;
+    sqe->len           = IORING_POLL_ADD_MULTI;
     sqe->poll32_events = POLLIN;
-    sqe->user_data = user_data;
+    sqe->user_data     = user_data;
 
     commit_sqe(ring);
 }
@@ -164,7 +166,7 @@ void uring_prep_timeout(abraxas_ring_t *ring,
     sqe->opcode    = IORING_OP_TIMEOUT;
     sqe->fd        = -1;
     sqe->addr      = (uint64_t)(uintptr_t)ts;
-    sqe->len       = 1;  /* count = 1: complete after 1 timeout or 1 other event */
+    sqe->len       = 1;  /* 1 timespec entry; event count is sqe->off (0 = pure timeout) */
     sqe->user_data = user_data;
 
     commit_sqe(ring);

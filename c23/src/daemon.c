@@ -46,6 +46,13 @@ constexpr uint64_t EV_TIMEOUT = 3;
 constexpr uint64_t EV_CANCEL  = 4;
 constexpr uint64_t EV_WEATHER = 5;
 
+/* Atomic event flag bitmask */
+constexpr uint32_t FLAG_TIMER    = 1u << 0;
+constexpr uint32_t FLAG_SIGNAL   = 1u << 1;
+constexpr uint32_t FLAG_WEATHER  = 1u << 2;
+constexpr uint32_t FLAG_OVERRIDE = 1u << 3;
+constexpr uint32_t FLAG_CONFIG   = 1u << 4;
+
 /* --- Gamma control (libmeridian direct calls) --- */
 
 static meridian_state_t *gamma_state = nullptr;
@@ -163,6 +170,46 @@ static void process_inotify(int inotify_fd, const daemon_state_t *state,
     }
 }
 
+/* Multi-shot poll liveness tracking */
+typedef struct {
+    bool inotify;
+    bool signal;
+    bool weather;
+} poll_state_t;
+
+/* Unified CQE handler -- used by both main drain and cancel drain. */
+static void process_cqe(const struct io_uring_cqe *cqe,
+                         _Atomic uint32_t *events,
+                         poll_state_t *polls,
+                         int inotify_fd, const daemon_state_t *state)
+{
+    bool more = cqe->flags & IORING_CQE_F_MORE;
+    switch (cqe->user_data) {
+    case EV_TIMEOUT:
+        *events |= FLAG_TIMER;
+        break;
+    case EV_SIGNAL:
+        *events |= FLAG_SIGNAL;
+        if (!more) polls->signal = false;
+        break;
+    case EV_INOTIFY:
+        if (cqe->res > 0) {
+            bool cfg = false, ovr = false;
+            process_inotify(inotify_fd, state, &cfg, &ovr);
+            if (cfg) *events |= FLAG_CONFIG;
+            if (ovr) *events |= FLAG_OVERRIDE;
+        }
+        if (!more) polls->inotify = false;
+        break;
+    case EV_WEATHER:
+        if (cqe->res > 0) *events |= FLAG_WEATHER;
+        if (!more) polls->weather = false;
+        break;
+    case EV_CANCEL:
+        break;
+    }
+}
+
 /* --- io_uring event loop --- */
 
 static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
@@ -175,60 +222,51 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
 
     weather_fetch_state_t wfs;
     weather_async_init(&wfs);
+    poll_state_t polls = {0};
 
     while (1) {
-        /* Submit: poll both fds + timeout */
-        if (inotify_fd >= 0)
+        /* Register multi-shot polls only when not alive */
+        if (inotify_fd >= 0 && !polls.inotify) {
             uring_prep_poll(ring, inotify_fd, EV_INOTIFY);
-        if (signal_fd >= 0)
+            polls.inotify = true;
+        }
+        if (signal_fd >= 0 && !polls.signal) {
             uring_prep_poll(ring, signal_fd, EV_SIGNAL);
-        if (wfs.pipe_fd >= 0)
+            polls.signal = true;
+        }
+        if (wfs.pipe_fd >= 0 && !polls.weather) {
             uring_prep_poll(ring, wfs.pipe_fd, EV_WEATHER);
+            polls.weather = true;
+        }
+
+        /* Fresh timeout each iteration (one-shot) */
         uring_prep_timeout(ring, &ts, EV_TIMEOUT);
 
         int ret = uring_submit_and_wait(ring);
         if (ret < 0 && errno != EINTR) break;
 
-        /* Process completions */
-        bool timer_expired = false;
-        bool got_signal = false;
-        _Atomic bool weather_ready = false;
-        bool config_changed = false;
-        bool override_changed = false;
-
+        /* Process all CQEs through unified handler */
+        _Atomic uint32_t events = 0;
         struct io_uring_cqe *cqe;
         while (uring_peek_cqe(ring, &cqe)) {
-            switch (cqe->user_data) {
-            case EV_TIMEOUT:
-                timer_expired = true;
-                break;
-            case EV_SIGNAL:
-                got_signal = true;
-                break;
-            case EV_INOTIFY:
-                if (cqe->res > 0)
-                    process_inotify(inotify_fd, state,
-                                    &config_changed, &override_changed);
-                break;
-            case EV_WEATHER:
-                if (cqe->res > 0) weather_ready = true;
-                break;
-            case EV_CANCEL:
-                break;
-            }
+            process_cqe(cqe, &events, &polls, inotify_fd, state);
             uring_cqe_seen(ring);
         }
 
-        /* If we woke early (inotify/signal), cancel the pending timeout */
-        if (!timer_expired) {
+        uint32_t flags = events;
+
+        /* Cancel timeout if woke early -- drain through same handler */
+        if (!(flags & FLAG_TIMER)) {
             uring_prep_cancel(ring, EV_TIMEOUT, EV_CANCEL);
             uring_submit_and_wait(ring);
-            /* Drain cancel completion */
-            while (uring_peek_cqe(ring, &cqe))
+            while (uring_peek_cqe(ring, &cqe)) {
+                process_cqe(cqe, &events, &polls, inotify_fd, state);
                 uring_cqe_seen(ring);
+            }
+            flags = events;
         }
 
-        if (got_signal) {
+        if (flags & FLAG_SIGNAL) {
             /* Drain signalfd so it doesn't refire */
             if (signal_fd >= 0) {
                 struct signalfd_siginfo si;
@@ -244,7 +282,7 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
 
         time_t now = time(nullptr);
 
-        if (config_changed) {
+        if (flags & FLAG_CONFIG) {
             location_t new_loc = config_load_location(&state->paths);
             if (new_loc.valid) {
                 state->location = new_loc;
@@ -254,7 +292,7 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
             state->weather = config_load_weather_cache(&state->paths);
         }
 
-        if (override_changed) {
+        if (flags & FLAG_OVERRIDE) {
             override_state_t od = config_load_override(&state->paths);
 
             if (od.active && od.issued_at != state->manual_issued_at) {
@@ -302,10 +340,11 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
             fprintf(stderr, "[%02d:%02d:%02d] Starting weather fetch...\n",
                     nt.tm_hour, nt.tm_min, nt.tm_sec);
             (void)weather_async_start(&wfs, state->location.lat, state->location.lon);
+            polls.weather = false; /* new pipe_fd needs registration */
         }
 
         /* Process async weather data if pipe signaled */
-        if (weather_ready && wfs.phase != WEATHER_IDLE) {
+        if ((flags & FLAG_WEATHER) && wfs.phase != WEATHER_IDLE) {
             weather_data_t result;
             int rc = weather_async_read(&wfs, &result);
             if (rc == -1) {
@@ -317,9 +356,10 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
                            state->weather.forecast, state->weather.cloud_cover);
                 else
                     fprintf(stderr, "  Weather fetch failed\n");
+                polls.weather = false;
             }
-            /* rc==0: EAGAIN, re-poll next iteration */
-            /* rc==1: phase transition, new pipe_fd, poll next iteration */
+            /* rc==0: EAGAIN, multi-shot poll still alive */
+            if (rc == 1) polls.weather = false; /* phase transition, new pipe_fd */
         }
 #endif
 
@@ -491,7 +531,7 @@ void daemon_run(daemon_state_t *state)
         fprintf(stderr, "[fatal] io_uring_setup failed (kernel >= 5.1 required)\n");
         exit(1);
     }
-    fprintf(stderr, "[kernel] io_uring initialized (1 syscall/tick)\n\n");
+    fprintf(stderr, "[kernel] io_uring initialized (multi-shot)\n\n");
     event_loop_uring(state, &ring, inotify_fd, signal_fd);
     uring_destroy(&ring);
 

@@ -44,7 +44,7 @@ bool uring_init(abraxas_ring_t *ring, uint32_t entries);
 /* Tear down io_uring (munmap + close). */
 void uring_destroy(abraxas_ring_t *ring);
 
-/* Prepare a POLL_ADD SQE for the given fd. user_data identifies the event. */
+/* Prepare a multi-shot POLL_ADD SQE. fd stays monitored until closed/cancelled. */
 void uring_prep_poll(abraxas_ring_t *ring, int fd, uint64_t user_data);
 
 /* Prepare a TIMEOUT SQE. ts is relative time. user_data identifies the event. */
