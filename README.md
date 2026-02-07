@@ -1,12 +1,12 @@
 # ABRAXAS
 
-A daemon available in C23 or Rust that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location. ABRAXAS allows for USA-specific builds (alongside manual calls for international users) which utilize NOAA data to further assist in screen temperature shifts during non-ideal weather.
+A daemon available in C23 or Rust that smoothly adjusts your screen's color temperature throughout the day based on the sun's position at your location.
 
 **Key Features:**
 
 ### Solar Grayline Engine
-- **Worldwide Usage**: Offline sunrise/sunset from Jean Meeus algorithms -- pure trig, no network call, any latitude/longitude
-- **Sigmoid Transitions**: Normalized sigmoid over 90-min dawn and 180-min dusk windows (front-loaded 30 min before sunset, k=8), imperceptible at both ends
+- **Worldwide Usage**: Offline sunrise/sunset from Jean Meeus algorithms based on any latitude/longitude
+- **Sigmoid Transitions**: Normalized sigmoid over 90-min dawn and 180-min dusk windows with indoor-aware offsets (dawn midpoint 30 min after sunrise, dusk midpoint 30 min before sunset, k=8)
 - **Endpoint Normalization**: Exact [0, 1] output over [-1, 1] domain -- no residual drift at target temperatures
 - **Weather Awareness (US, optional)**: NOAA api.weather.gov cloud cover shifts daytime target (6500K clear, 4500K overcast). See [Build & Install](#build--install) for international builds
 - **Manual Override**: `--set TEMP MINUTES` with the same sigmoid curve, auto-resumes at next transition window
@@ -61,9 +61,9 @@ A daemon available in C23 or Rust that smoothly adjusts your screen's color temp
 | Dependencies | geoclue, X11 | cron, redshift | libc, libm (all backends runtime-loaded) |
 | Scheduler needed | Yes | Is the scheduler | No |
 
-## MAIN EVENT: C23 vs. Rust
+## C23 vs. Rust
 
-Both implementations produce the same `abraxas` binary, same CLI interface, same config files, same systemd service. Pick at install time. Run `./test.py` for a head-to-head comparison across every subsystem.
+Both implementations produce the same `abraxas` binary while utilizing the same patterns for CLI interface, config files, systemd service. Pick at install time. Run `./test.py` for an analytical comparison across every subsystem.
 
 ### Implementation
 
@@ -86,7 +86,7 @@ Both implementations produce the same `abraxas` binary, same CLI interface, same
 | Heap allocs/tick | 0                  | 0                  |
 | Default backends | auto (pkg-config)  | noaa + x11 (cargo) |
 
-### Measured Performance (test.py, 2026-02-06)
+### Measured Performance
 
 |                     | C23          | Rust (glibc)  | Rust (musl)    |
 |---------------------|--------------|---------------|----------------|
@@ -218,13 +218,13 @@ A linear ramp has constant rate, which produces visible start and stop artifacts
        sunset-90   sunset    sunset+90     Time
 ```
 
-**Dusk** (canonical): 180-minute window, front-loaded 30 minutes before sunset (runs from sunset-120min to sunset+60min). The sigmoid midpoint hits at sunset-30min, so the steep k=8 drop happens during golden hour -- by sunset you're already at ~3200K. **Dawn** (inverse): 90-minute window centered on sunrise. `x` sweeps `-1` to `+1`. Same function, no offset.
+Both transitions are offset to account for indoor usage -- you don't get direct sunlight the moment the sun crosses the horizon.
+
+**Dusk** (canonical): 180-minute window, front-loaded 30 minutes before sunset (runs from sunset-120min to sunset+60min). The sigmoid midpoint hits at sunset-30min, so the steep k=8 drop happens during golden hour -- by sunset you're already at ~3200K.
+
+**Dawn** (inverse): 90-minute window, back-loaded 30 minutes after sunrise (runs from sunrise-15min to sunrise+75min). The sigmoid midpoint hits at sunrise+30min, so the screen stays warm through early morning when indoor light is still dim. At sunrise you're only ~15% through the transition (~3400K); full daylight temperature arrives ~75 minutes after sunrise.
 
 **Manual overrides** use the same curve. `abraxas --set 3500 30` maps [0, 30 min] to [-1, 1] and interpolates between current temperature and 3500K.
-
-**Endpoint normalization.** A raw sigmoid with k=6 outputs 0.0025 at x=-1 and 0.9975 at x=+1. Over a 3600K range that's 9K of drift at the boundaries. The output is normalized to hit exact 0.0 and 1.0 at window edges -- no residual error at target temperatures.
-
-## Manual Override
 
 When `--set TEMP MINUTES` is called, the daemon enters manual mode:
 
@@ -234,6 +234,8 @@ When `--set TEMP MINUTES` is called, the daemon enters manual mode:
 4. At that point, the flag clears and solar-based control resumes
 
 The manual call communicates with the running daemon via a control file (watched by inotify via IN_CLOSE_WRITE). The daemon itself drives the gamma -- no second process. If the daemon is not running, the CLI warns the user that the override was saved but won't apply until the daemon starts.
+
+**Endpoint normalization.** A raw sigmoid with k=6 outputs 0.0025 at x=-1 and 0.9975 at x=+1. Over a 3600K range that's 9K of drift at the boundaries. The output is normalized to hit exact 0.0 and 1.0 at window edges -- no residual error at target temperatures.
 
 ## Weather Awareness
 
@@ -394,8 +396,9 @@ constexpr int TEMP_NIGHT     = 2900;    // Night temperature (K)
 constexpr int CLOUD_THRESHOLD = 75;     // Cloud cover % to trigger dark mode
 constexpr int WEATHER_REFRESH_SEC = 900; // 15 minutes
 constexpr int TEMP_UPDATE_SEC = 60;
-constexpr int DAWN_DURATION = 90;       // Dawn window (minutes, centered on sunrise)
-constexpr int DUSK_DURATION = 180;      // Dusk window (minutes, total)
+constexpr int DAWN_DURATION = 90;       // Dawn window (minutes)
+constexpr int DUSK_DURATION = 180;      // Dusk window (minutes)
+constexpr int DAWN_OFFSET   = 30;       // Shift sigmoid midpoint this many min after sunrise
 constexpr int DUSK_OFFSET   = 30;       // Shift sigmoid midpoint this many min before sunset
 constexpr double SIGMOID_STEEPNESS = 8.0; // Higher = sharper mid-transition
 ```

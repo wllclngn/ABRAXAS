@@ -43,6 +43,9 @@ pub const TEMP_UPDATE_SEC: i64 = 60; // 1 minute
 pub const DAWN_DURATION: f64 = 90.0;
 pub const DUSK_DURATION: f64 = 180.0;
 
+/// Dawn offset: shift sigmoid midpoint this many minutes after sunrise
+pub const DAWN_OFFSET: f64 = 30.0;
+
 /// Dusk offset: shift sigmoid midpoint this many minutes before sunset
 pub const DUSK_OFFSET: f64 = 30.0;
 
@@ -203,7 +206,7 @@ fn main() {
 }
 
 fn cmd_status(lat: f64, lon: f64, paths: &config::Paths) {
-    println!("ABRAXAS v8.0.0 [Rust]\n");
+    println!("ABRAXAS v8.1.0 [Rust]\n");
     println!("Location: {:.4}, {:.4}\n", lat, lon);
 
     let now = chrono_now();
@@ -412,7 +415,7 @@ fn cmd_reset(paths: &config::Paths) {
 }
 
 fn cmd_benchmark(paths: &config::Paths) {
-    println!("ABRAXAS v8.0.0 [Rust] -- Kernel-grade benchmark");
+    println!("ABRAXAS v8.1.0 [Rust] -- Kernel-grade benchmark");
     println!("Clock: CLOCK_MONOTONIC_RAW (hardware TSC)\n");
 
     fn bench_ns() -> u64 {

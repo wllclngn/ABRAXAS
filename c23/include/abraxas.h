@@ -31,6 +31,9 @@ constexpr int TEMP_UPDATE_SEC     = 60;    /* 1 minute   */
 constexpr int DAWN_DURATION = 90;
 constexpr int DUSK_DURATION = 180;
 
+/* Dawn offset: shift sigmoid midpoint this many minutes after sunrise */
+constexpr int DAWN_OFFSET = 30;
+
 /* Dusk offset: shift sigmoid midpoint this many minutes before sunset */
 constexpr int DUSK_OFFSET = 30;
 

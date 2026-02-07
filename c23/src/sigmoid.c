@@ -36,9 +36,10 @@ int calculate_solar_temp(double minutes_from_sunrise, double minutes_to_sunset,
     double dawn_half = DAWN_DURATION / 2.0;
     double dusk_half = DUSK_DURATION / 2.0;
 
-    /* Dawn: night -> day (inverse of dusk) */
-    if (fabs(minutes_from_sunrise) < dawn_half) {
-        double x = minutes_from_sunrise / dawn_half;     /* [-1, 1] */
+    /* Dawn: night -> day (inverse of dusk, midpoint offset after sunrise) */
+    double dawn_shifted = minutes_from_sunrise - DAWN_OFFSET;
+    if (fabs(dawn_shifted) < dawn_half) {
+        double x = dawn_shifted / dawn_half;              /* [-1, 1] */
         double factor = sigmoid_norm(x, SIGMOID_STEEPNESS);
         return (int)(night_temp + (day_temp - night_temp) * factor);
     }
@@ -52,7 +53,7 @@ int calculate_solar_temp(double minutes_from_sunrise, double minutes_to_sunset,
     }
 
     /* Daytime (between windows) */
-    if (minutes_from_sunrise >= dawn_half && dusk_shifted >= dusk_half)
+    if (dawn_shifted >= dawn_half && dusk_shifted >= dusk_half)
         return day_temp;
 
     /* Night */
@@ -81,7 +82,7 @@ time_t next_transition_resume(time_t now, double lat, double lon)
     sun_times_t st = solar_sunrise_sunset(now, lat, lon);
     if (!st.valid) return now + SECONDS_PER_DAY; /* polar fallback: 24h */
 
-    time_t dawn_window_start = st.sunrise - (time_t)(DAWN_DURATION / 2) * 60;
+    time_t dawn_window_start = st.sunrise - (time_t)(DAWN_DURATION / 2 - DAWN_OFFSET) * 60;
     time_t dusk_window_start = st.sunset  - (time_t)(DUSK_DURATION / 2 + DUSK_OFFSET) * 60;
 
     time_t resume_dawn = dawn_window_start - 15 * 60;
@@ -98,5 +99,5 @@ time_t next_transition_resume(time_t now, double lat, double lon)
     time_t tomorrow = now + SECONDS_PER_DAY;
     sun_times_t st2 = solar_sunrise_sunset(tomorrow, lat, lon);
     if (!st2.valid) return now + SECONDS_PER_DAY;
-    return st2.sunrise - (time_t)(DAWN_DURATION / 2 + 15) * 60;
+    return st2.sunrise - (time_t)(DAWN_DURATION / 2 - DAWN_OFFSET + 15) * 60;
 }

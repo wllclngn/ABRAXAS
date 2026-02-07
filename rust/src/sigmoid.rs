@@ -5,7 +5,7 @@
 //! Manual overrides use the same sigmoid over [0, duration].
 
 use crate::{
-    DAWN_DURATION, DUSK_DURATION, DUSK_OFFSET, SIGMOID_STEEPNESS, TEMP_DAY_CLEAR, TEMP_DAY_DARK,
+    DAWN_DURATION, DAWN_OFFSET, DUSK_DURATION, DUSK_OFFSET, SIGMOID_STEEPNESS, TEMP_DAY_CLEAR, TEMP_DAY_DARK,
     TEMP_NIGHT,
 };
 use crate::solar;
@@ -38,9 +38,10 @@ pub fn calculate_solar_temp(
     let dawn_half = DAWN_DURATION / 2.0;
     let dusk_half = DUSK_DURATION / 2.0;
 
-    // Dawn: night -> day (inverse of dusk)
-    if minutes_from_sunrise.abs() < dawn_half {
-        let x = minutes_from_sunrise / dawn_half; // [-1, 1]
+    // Dawn: night -> day (inverse of dusk, midpoint offset after sunrise)
+    let dawn_shifted = minutes_from_sunrise - DAWN_OFFSET;
+    if dawn_shifted.abs() < dawn_half {
+        let x = dawn_shifted / dawn_half; // [-1, 1]
         let factor = sigmoid_norm(x, SIGMOID_STEEPNESS);
         return (night_temp as f64 + (day_temp - night_temp) as f64 * factor) as i32;
     }
@@ -54,7 +55,7 @@ pub fn calculate_solar_temp(
     }
 
     // Daytime (between windows)
-    if minutes_from_sunrise >= dawn_half && dusk_shifted >= dusk_half {
+    if dawn_shifted >= dawn_half && dusk_shifted >= dusk_half {
         return day_temp;
     }
 
@@ -93,7 +94,7 @@ pub fn next_transition_resume(now: i64, lat: f64, lon: f64) -> i64 {
         None => return now + SECONDS_PER_DAY, // polar fallback: 24h
     };
 
-    let dawn_window_start = st.sunrise - (DAWN_DURATION / 2.0 * 60.0) as i64;
+    let dawn_window_start = st.sunrise - ((DAWN_DURATION / 2.0 - DAWN_OFFSET) * 60.0) as i64;
     let dusk_window_start = st.sunset - ((DUSK_DURATION / 2.0 + DUSK_OFFSET) * 60.0) as i64;
 
     let resume_dawn = dawn_window_start - 15 * 60;
@@ -115,7 +116,7 @@ pub fn next_transition_resume(now: i64, lat: f64, lon: f64) -> i64 {
     // Both today's transitions passed -- use tomorrow's dawn
     let tomorrow = now + SECONDS_PER_DAY;
     match solar::sunrise_sunset(tomorrow, lat, lon) {
-        Some(st2) => st2.sunrise - ((DAWN_DURATION / 2.0 + 15.0) * 60.0) as i64,
+        Some(st2) => st2.sunrise - ((DAWN_DURATION / 2.0 - DAWN_OFFSET + 15.0) * 60.0) as i64,
         None => now + SECONDS_PER_DAY,
     }
 }

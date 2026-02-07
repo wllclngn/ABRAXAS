@@ -1802,7 +1802,7 @@ def run_tests(skip_build=False):
 
     print()
     print("=" * 64)
-    print("             ABRAXAS TEST SUITE v8.0.0")
+    print("             ABRAXAS TEST SUITE v8.1.0")
     print("         C23 vs. Rust vs. Rust-musl -- Head to Head")
     print("=" * 64)
 
