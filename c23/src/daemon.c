@@ -31,6 +31,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
@@ -356,6 +357,15 @@ void daemon_run(daemon_state_t *state)
     fprintf(stderr, "Weather refresh: every %d min\n", WEATHER_REFRESH_SEC / 60);
     fprintf(stderr, "Temperature update: every %ds\n", TEMP_UPDATE_SEC);
 
+    /* Block SIGTERM/SIGINT immediately and create signalfd.
+     * Must happen before gamma retry so SIGTERM is never lost during init.
+     * The signalfd is polled between gamma retries and consumed in the event loop. */
+    int signal_fd = create_signalfd_masked();
+    if (signal_fd >= 0)
+        fprintf(stderr, "[kernel] signalfd created (fd=%d)\n", signal_fd);
+    else
+        fprintf(stderr, "[warn] signalfd failed\n");
+
     /* Retry gamma init -- display server may not be ready at boot.
      * Poll every 500ms for up to 30s to catch X11/Wayland readiness fast. */
     constexpr int  GAMMA_INIT_MAX_RETRIES = 60;
@@ -365,6 +375,15 @@ void daemon_run(daemon_state_t *state)
         if (attempt == GAMMA_INIT_MAX_RETRIES - 1) {
             fprintf(stderr, "[fatal] No gamma backend after 30s\n");
             exit(1);
+        }
+        /* Check for SIGTERM between retries (non-blocking) */
+        if (signal_fd >= 0) {
+            struct pollfd pfd = { .fd = signal_fd, .events = POLLIN };
+            if (poll(&pfd, 1, 0) > 0) {
+                fprintf(stderr, "Received signal during gamma init, exiting...\n");
+                close(signal_fd);
+                exit(0);
+            }
         }
         struct timespec ts = { .tv_sec = 0, .tv_nsec = GAMMA_INIT_RETRY_NS };
         nanosleep(&ts, nullptr);
@@ -391,12 +410,6 @@ void daemon_run(daemon_state_t *state)
         fprintf(stderr, "[kernel] inotify watching %s (fd=%d)\n", state->paths.config_dir, inotify_fd);
     else
         fprintf(stderr, "[warn] inotify failed, config changes require restart\n");
-
-    int signal_fd = create_signalfd_masked();
-    if (signal_fd >= 0)
-        fprintf(stderr, "[kernel] signalfd created (fd=%d)\n", signal_fd);
-    else
-        fprintf(stderr, "[warn] signalfd failed\n");
 
     /* prctl hardening */
     prctl(PR_SET_TIMERSLACK, 1);         /* 1ns timer precision (default 50us) */

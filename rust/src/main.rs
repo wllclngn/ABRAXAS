@@ -203,7 +203,7 @@ fn main() {
 }
 
 fn cmd_status(lat: f64, lon: f64, paths: &config::Paths) {
-    println!("ABRAXAS v6.1.0 [Rust]\n");
+    println!("ABRAXAS v7.0.0 [Rust]\n");
     println!("Location: {:.4}, {:.4}\n", lat, lon);
 
     let now = chrono_now();
@@ -412,7 +412,7 @@ fn cmd_reset(paths: &config::Paths) {
 }
 
 fn cmd_benchmark(paths: &config::Paths) {
-    println!("ABRAXAS v6.1.0 [Rust] -- Kernel-grade benchmark");
+    println!("ABRAXAS v7.0.0 [Rust] -- Kernel-grade benchmark");
     println!("Clock: CLOCK_MONOTONIC_RAW (hardware TSC)\n");
 
     fn bench_ns() -> u64 {

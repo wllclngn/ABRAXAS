@@ -261,6 +261,10 @@ fn parse_inotify_fd(fd: i32, paths: &Paths, result: &mut EventResult) {
 }
 
 pub fn run(location: Location, paths: &Paths) {
+    // Block SIGTERM/SIGINT immediately and create signalfd.
+    // Must happen before gamma retry so SIGTERM is never lost during init.
+    let signal_fd = setup_signalfd();
+
     // Initialize gamma with retries
     let mut gamma_state = None;
     for attempt in 0..GAMMA_INIT_MAX_RETRIES {
@@ -273,6 +277,19 @@ pub fn run(location: Location, paths: &Paths) {
                 if attempt == GAMMA_INIT_MAX_RETRIES - 1 {
                     eprintln!("[fatal] No gamma backend after 30s: {}", e);
                     std::process::exit(1);
+                }
+                // Check for SIGTERM between retries (non-blocking)
+                if signal_fd >= 0 {
+                    let mut pfd = libc::pollfd {
+                        fd: signal_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+                        eprintln!("Received signal during gamma init, exiting...");
+                        unsafe { libc::close(signal_fd) };
+                        std::process::exit(0);
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(GAMMA_INIT_RETRY_MS));
             }
@@ -300,7 +317,6 @@ pub fn run(location: Location, paths: &Paths) {
 
     // Create kernel fds
     let ino_fd = setup_inotify(&state.paths);
-    let signal_fd = setup_signalfd();
 
     // Write PID file
     if let Err(e) = config::write_pid(&state.paths) {

@@ -73,7 +73,7 @@ static bool http_get(const char *url, response_buf_t *resp)
 
     char *argv[] = {
         "curl", "-s", "-f", "-L", "--max-time", "5",
-        "-H", "User-Agent: abraxas/6.1 (weather color temp daemon)",
+        "-H", "User-Agent: abraxas/7.0 (weather color temp daemon)",
         "-H", "Accept: application/geo+json",
         (char *)url, nullptr
     };

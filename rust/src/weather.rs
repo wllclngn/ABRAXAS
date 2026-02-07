@@ -38,7 +38,7 @@ fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = std::process::Command::new("curl")
         .args([
             "-s", "-f", "-L", "--max-time", "5",
-            "-H", "User-Agent: abraxas/6.1 (weather color temp daemon)",
+            "-H", "User-Agent: abraxas/7.0 (weather color temp daemon)",
             "-H", "Accept: application/geo+json",
             url,
         ])

@@ -1209,6 +1209,217 @@ def test_daemon_rapid_overrides(R):
 
 
 # =============================================================================
+# DAEMON: SIGTERM RESPONSIVENESS (orphan prevention regression test)
+# =============================================================================
+
+SIGTERM_DEADLINE_SEC = 3
+
+def test_sigterm_responsiveness(R):
+    """Verify SIGTERM kills the daemon promptly at every init phase.
+
+    Catches the v6.0.0 bug where sigprocmask(SIG_BLOCK) before the event
+    loop caused SIGTERM to be queued but never delivered, producing orphan
+    daemons that survived systemd restart.
+
+    Tests three windows:
+      1. Immediate (0.5s) -- during gamma init retry
+      2. Mid-init (2.0s)  -- after gamma, before/during kernel fd setup
+      3. Steady-state (5s) -- in the io_uring event loop
+
+    All must exit within 3 seconds of SIGTERM. Failure = signal lost.
+    """
+    R.section("DAEMON: SIGTERM RESPONSIVENESS (orphan prevention)")
+
+    phases = [
+        (0.5, "gamma-init (0.5s)"),
+        (2.0, "mid-init (2.0s)"),
+        (5.0, "steady-state (5.0s)"),
+    ]
+
+    for name, binary in _all_binaries():
+        if not binary.exists():
+            R.skip(f"{name} SIGTERM", "binary not built")
+            continue
+
+        for delay, phase in phases:
+            test_home, config_dir, env = make_test_env()
+            proc = None
+            try:
+                loc_str = f"{TEST_LAT},{TEST_LON}"
+                run_cmd([str(binary), "--set-location", loc_str], env=env)
+
+                fd, stderr_path = tempfile.mkstemp(prefix='abraxas_sigterm_')
+                stderr_file = os.fdopen(fd, 'w+b')
+
+                proc = subprocess.Popen(
+                    [str(binary), "--daemon"],
+                    env=env, stdout=subprocess.DEVNULL, stderr=stderr_file,
+                    start_new_session=True,
+                )
+                proc._stderr_path = stderr_path
+                proc._stderr_file = stderr_file
+                _active_daemons.append(proc)
+
+                time.sleep(delay)
+
+                if proc.poll() is not None:
+                    # Daemon already exited (no gamma backend)
+                    if proc in _active_daemons:
+                        _active_daemons.remove(proc)
+                    _daemon_cleanup_files(proc)
+                    proc = None
+                    R.skip(f"{name}: SIGTERM @ {phase}", "exited before signal")
+                    continue
+
+                # Send SIGTERM and enforce strict deadline
+                proc.send_signal(signal.SIGTERM)
+                t0 = time.monotonic()
+
+                try:
+                    proc.wait(timeout=SIGTERM_DEADLINE_SEC)
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+
+                    if proc in _active_daemons:
+                        _active_daemons.remove(proc)
+                    _daemon_cleanup_files(proc)
+                    proc = None
+
+                    R.ok(f"{name}: SIGTERM @ {phase} -> exit in {elapsed_ms:.0f}ms")
+
+                except subprocess.TimeoutExpired:
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+
+                    # Read stderr to see where daemon was stuck
+                    stderr_file.seek(0)
+                    output = stderr_file.read().decode('utf-8', errors='replace')
+                    last_lines = '\n'.join(output.strip().split('\n')[-5:])
+
+                    R.fail(
+                        f"{name}: SIGTERM @ {phase} -> NO EXIT after "
+                        f"{elapsed_ms:.0f}ms (signal lost, would create orphan)",
+                        f"Last output:\n{last_lines}"
+                    )
+
+                    _kill_process_group(proc)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    if proc in _active_daemons:
+                        _active_daemons.remove(proc)
+                    _daemon_cleanup_files(proc)
+                    proc = None
+
+            finally:
+                if proc:
+                    _kill_daemon(proc)
+                cleanup_test_env(test_home)
+
+
+# =============================================================================
+# DAEMON: SIGTERM DURING GAMMA RETRY (duplicate daemon regression test)
+# =============================================================================
+
+def test_sigterm_during_gamma_retry(R):
+    """Reproduce the exact v6.0.0 orphan daemon bug.
+
+    Forces gamma init to fail (invalid DISPLAY, no Wayland) so the daemon
+    enters its 30-second retry loop. Sends SIGTERM at 2 seconds. Before
+    the fix (signalfd moved before gamma retry + poll between retries),
+    SIGTERM was either default-handled (pre-sigprocmask) or blocked and
+    never consumed (post-sigprocmask). This test catches both cases.
+
+    If the daemon doesn't exit within 3 seconds of SIGTERM, it would
+    become an orphan that survives systemd restart -- the exact bug.
+    """
+    R.section("DAEMON: SIGTERM DURING GAMMA RETRY (orphan regression)")
+
+    for name, binary in _all_binaries():
+        if not binary.exists():
+            R.skip(f"{name} gamma-retry SIGTERM", "binary not built")
+            continue
+
+        test_home, config_dir, env = make_test_env()
+        proc = None
+        try:
+            loc_str = f"{TEST_LAT},{TEST_LON}"
+            run_cmd([str(binary), "--set-location", loc_str], env=env)
+
+            # Force gamma init failure: invalid display, no Wayland
+            env['DISPLAY'] = 'invalid'
+            env.pop('WAYLAND_DISPLAY', None)
+
+            fd, stderr_path = tempfile.mkstemp(prefix='abraxas_gammaretry_')
+            stderr_file = os.fdopen(fd, 'w+b')
+
+            proc = subprocess.Popen(
+                [str(binary), "--daemon"],
+                env=env, stdout=subprocess.DEVNULL, stderr=stderr_file,
+                start_new_session=True,
+            )
+            proc._stderr_path = stderr_path
+            proc._stderr_file = stderr_file
+            _active_daemons.append(proc)
+
+            # Wait 2 seconds -- daemon should be in gamma retry loop
+            time.sleep(2)
+
+            if proc.poll() is not None:
+                # Daemon exited already (DRM worked, or immediate fatal)
+                if proc in _active_daemons:
+                    _active_daemons.remove(proc)
+                _daemon_cleanup_files(proc)
+                proc = None
+                R.skip(f"{name}: gamma-retry SIGTERM",
+                       "daemon exited before retry window")
+                continue
+
+            # Daemon is alive and stuck in gamma retry -- send SIGTERM
+            proc.send_signal(signal.SIGTERM)
+            t0 = time.monotonic()
+
+            try:
+                proc.wait(timeout=SIGTERM_DEADLINE_SEC)
+                elapsed_ms = (time.monotonic() - t0) * 1000
+
+                if proc in _active_daemons:
+                    _active_daemons.remove(proc)
+                _daemon_cleanup_files(proc)
+                proc = None
+
+                R.ok(f"{name}: SIGTERM during gamma retry -> exit in "
+                     f"{elapsed_ms:.0f}ms (orphan prevented)")
+
+            except subprocess.TimeoutExpired:
+                elapsed_ms = (time.monotonic() - t0) * 1000
+
+                stderr_file.seek(0)
+                output = stderr_file.read().decode('utf-8', errors='replace')
+                last_lines = '\n'.join(output.strip().split('\n')[-5:])
+
+                R.fail(
+                    f"{name}: SIGTERM during gamma retry -> NO EXIT after "
+                    f"{elapsed_ms:.0f}ms (ORPHAN DAEMON BUG)",
+                    f"Last output:\n{last_lines}"
+                )
+
+                _kill_process_group(proc)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                if proc in _active_daemons:
+                    _active_daemons.remove(proc)
+                _daemon_cleanup_files(proc)
+                proc = None
+
+        finally:
+            if proc:
+                _kill_daemon(proc)
+            cleanup_test_env(test_home)
+
+
+# =============================================================================
 # OVERRIDE FILE FORMAT COMPARISON
 # =============================================================================
 
@@ -1591,7 +1802,7 @@ def run_tests(skip_build=False):
 
     print()
     print("=" * 64)
-    print("             ABRAXAS TEST SUITE v6.0.0")
+    print("             ABRAXAS TEST SUITE v7.0.0")
     print("         C23 vs. Rust vs. Rust-musl -- Head to Head")
     print("=" * 64)
 
@@ -1630,6 +1841,8 @@ def run_tests(skip_build=False):
     test_daemon_multiple_overrides(R)
     test_daemon_set_resume_cycle(R)
     test_daemon_rapid_overrides(R)
+    test_sigterm_responsiveness(R)
+    test_sigterm_during_gamma_retry(R)
 
     # Performance
     test_performance(R)

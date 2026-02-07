@@ -18,6 +18,7 @@ import pwd
 import sys
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -153,11 +154,42 @@ def disable_service() -> bool:
         return False
 
 
+def stop_all_abraxas() -> None:
+    """Stop service, kill all abraxas processes, and verify they're dead.
+
+    Prevents duplicate daemons: the old process must be fully dead before
+    a new binary is installed and the service restarted.
+    """
+    base_cmd = get_systemctl_cmd()
+
+    # Stop the service (5s timeout -- old binaries may not respond to SIGTERM)
+    try:
+        subprocess.run(base_cmd + ["stop", "abraxas.service"],
+                       capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        log_warn("systemctl stop timed out, force-killing...")
+
+    # Kill any remaining abraxas processes (including strays)
+    subprocess.run(["pkill", "-x", "abraxas"], capture_output=True)
+    time.sleep(0.5)
+
+    # Verify dead -- escalate to SIGKILL if needed
+    ret, _, _ = run_cmd_capture(["pgrep", "-x", "abraxas"])
+    if ret == 0:
+        log_warn("Daemon still alive after SIGTERM, sending SIGKILL...")
+        subprocess.run(["pkill", "-9", "-x", "abraxas"], capture_output=True)
+        time.sleep(0.5)
+
+        ret, _, _ = run_cmd_capture(["pgrep", "-x", "abraxas"])
+        if ret == 0:
+            log_warn("Daemon survived SIGKILL (zombie?)")
+
+
 def restart_service() -> bool:
-    """Restart abraxas service if running."""
-    if is_service_active():
-        log_info("Restarting service...")
-        cmd = get_systemctl_cmd() + ["restart", "abraxas.service"]
+    """Start abraxas service if enabled."""
+    if is_service_enabled():
+        log_info("Starting service...")
+        cmd = get_systemctl_cmd() + ["start", "abraxas.service"]
         ret, _, _ = run_cmd_capture(cmd)
         return ret == 0
     return True
@@ -365,9 +397,10 @@ def cmd_install(args, source_dir: Path) -> bool:
     except OSError:
         pass
 
-    # Stop running abraxas before overwriting binary (ETXTBSY)
-    subprocess.run(get_systemctl_cmd() + ["stop", "abraxas.service"], capture_output=True)
-    subprocess.run(["pkill", "-x", "abraxas"], capture_output=True)
+    # Stop ALL running abraxas processes before overwriting binary.
+    # Prevents duplicate daemons and ETXTBSY.
+    log_info("Stopping existing abraxas processes...")
+    stop_all_abraxas()
 
     # Copy binary
     log_info(f"Installing {INSTALL_BINARY} [{impl_choice}]...")
@@ -659,6 +692,10 @@ def cmd_update(args, source_dir: Path) -> bool:
         if not build_abraxas_c23(source_dir, force=True, non_usa=non_usa):
             return False
         source_binary = source_dir / "c23" / "abraxas"
+
+    # Stop ALL running abraxas processes before overwriting binary
+    log_info("Stopping existing abraxas processes...")
+    stop_all_abraxas()
 
     log_info("Installing updates...")
     shutil.copy2(source_binary, INSTALL_BINARY)
