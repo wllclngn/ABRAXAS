@@ -113,7 +113,7 @@ fn compute_solar_params(jc: f64) -> SolarParams {
 /// Calculate sun position (elevation angle) at a given time and location
 pub fn position(when: i64, lat: f64, lon: f64) -> SunPosition {
     let mut lt: libc::tm = unsafe { std::mem::zeroed() };
-    let t = when as libc::time_t;
+    let t = when;
     unsafe { libc::localtime_r(&t, &mut lt) };
 
     let hour_frac = lt.tm_hour as f64 + lt.tm_min as f64 / 60.0 + lt.tm_sec as f64 / 3600.0;
@@ -152,7 +152,7 @@ pub fn position(when: i64, lat: f64, lon: f64) -> SunPosition {
 /// Calculate sunrise and sunset times for a given day and location
 pub fn sunrise_sunset(when: i64, lat: f64, lon: f64) -> Option<SunTimes> {
     let mut lt: libc::tm = unsafe { std::mem::zeroed() };
-    let t = when as libc::time_t;
+    let t = when;
     unsafe { libc::localtime_r(&t, &mut lt) };
 
     // Use noon of the given day

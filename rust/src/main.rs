@@ -13,8 +13,11 @@
 mod config;
 mod daemon;
 mod gamma;
+mod landlock;
+mod seccomp;
 mod sigmoid;
 mod solar;
+mod uring;
 mod weather;
 mod zipdb;
 
@@ -54,6 +57,7 @@ enum Command {
     Set { temp: i32, duration: i32 },
     Resume,
     Reset,
+    Benchmark,
 }
 
 fn print_usage() {
@@ -68,6 +72,7 @@ fn print_usage() {
     eprintln!("  --set TEMP [MINUTES]  Override to TEMP over MINUTES (default 3)");
     eprintln!("  --resume              Clear override, resume solar control");
     eprintln!("  --reset               Restore gamma and exit");
+    eprintln!("  --benchmark           Run nanosecond benchmark");
     eprintln!("  --help                Show this help");
 }
 
@@ -119,6 +124,7 @@ fn parse_args() -> Command {
         }
         "--resume" | "resume" => Command::Resume,
         "--reset" | "reset" => Command::Reset,
+        "--benchmark" | "benchmark" => Command::Benchmark,
         "--help" | "-h" | "help" => {
             print_usage();
             process::exit(0);
@@ -150,6 +156,10 @@ fn main() {
         }
         Command::Resume => {
             cmd_resume(&paths);
+            return;
+        }
+        Command::Benchmark => {
+            cmd_benchmark(&paths);
             return;
         }
         Command::SetLocation(location) => {
@@ -193,7 +203,7 @@ fn main() {
 }
 
 fn cmd_status(lat: f64, lon: f64, paths: &config::Paths) {
-    println!("ABRAXAS v5.1.0 [Rust]\n");
+    println!("ABRAXAS v6.0.0 [Rust]\n");
     println!("Location: {:.4}, {:.4}\n", lat, lon);
 
     let now = chrono_now();
@@ -401,6 +411,107 @@ fn cmd_reset(paths: &config::Paths) {
     println!("Screen temperature reset.");
 }
 
+fn cmd_benchmark(paths: &config::Paths) {
+    println!("ABRAXAS v6.0.0 [Rust] -- Kernel-grade benchmark");
+    println!("Clock: CLOCK_MONOTONIC_RAW (hardware TSC)\n");
+
+    fn bench_ns() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    const N: u64 = 1000;
+
+    // config_load_location
+    let start = bench_ns();
+    for _ in 0..N {
+        let _ = config::load_location(paths);
+    }
+    let elapsed = bench_ns() - start;
+    println!("  config_load_location()     {:>8} us  ({} ns/call, {} calls)",
+        elapsed / 1000, elapsed / N, N);
+
+    // Get location for solar calcs
+    let loc = config::load_location(paths);
+    let (lat, lon) = loc.map(|l| (l.lat, l.lon)).unwrap_or((41.88, -87.63));
+    let now = now_epoch();
+
+    // solar_sunrise_sunset
+    let start = bench_ns();
+    for _ in 0..N {
+        let _ = solar::sunrise_sunset(now, lat, lon);
+    }
+    let elapsed = bench_ns() - start;
+    println!("  solar_sunrise_sunset()     {:>8} us  ({} ns/call, {} calls)",
+        elapsed / 1000, elapsed / N, N);
+
+    // solar_position
+    let start = bench_ns();
+    for _ in 0..N {
+        let _ = solar::position(now, lat, lon);
+    }
+    let elapsed = bench_ns() - start;
+    println!("  solar_position()           {:>8} us  ({} ns/call, {} calls)",
+        elapsed / 1000, elapsed / N, N);
+
+    // calculate_solar_temp
+    let start = bench_ns();
+    for _ in 0..N {
+        std::hint::black_box(sigmoid::calculate_solar_temp(
+            std::hint::black_box(120.0),
+            std::hint::black_box(300.0),
+            false,
+        ));
+    }
+    let elapsed = bench_ns() - start;
+    println!("  calculate_solar_temp()     {:>8} us  ({} ns/call, {} calls)",
+        elapsed / 1000, elapsed / N, N);
+
+    // sigmoid_norm
+    let start = bench_ns();
+    for _ in 0..N {
+        std::hint::black_box(sigmoid::sigmoid_norm(
+            std::hint::black_box(0.5),
+            std::hint::black_box(SIGMOID_STEEPNESS),
+        ));
+    }
+    let elapsed = bench_ns() - start;
+    println!("  sigmoid_norm()             {:>8} us  ({} ns/call, {} calls)",
+        elapsed / 1000, elapsed / N, N);
+
+    // config_load_override
+    let start = bench_ns();
+    for _ in 0..N {
+        let _ = config::load_override(paths);
+    }
+    let elapsed = bench_ns() - start;
+    println!("  config_load_override()     {:>8} us  ({} ns/call, {} calls)",
+        elapsed / 1000, elapsed / N, N);
+
+    // config_load_weather_cache
+    let start = bench_ns();
+    for _ in 0..N {
+        let _ = config::load_weather_cache(paths);
+    }
+    let elapsed = bench_ns() - start;
+    println!("  config_load_weather_cache(){:>8} us  ({} ns/call, {} calls)",
+        elapsed / 1000, elapsed / N, N);
+
+    // io_uring setup + teardown
+    println!();
+    println!("Kernel facilities:");
+    let start = bench_ns();
+    let ring = uring::AbraxasRing::init(8);
+    let elapsed = bench_ns() - start;
+    if ring.is_some() {
+        println!("  io_uring_setup()           {:>8} us  (one-time)", elapsed / 1000);
+        drop(ring);
+    } else {
+        println!("  io_uring_setup()           UNAVAILABLE");
+    }
+}
+
 // Time helpers
 
 pub fn now_epoch() -> i64 {
@@ -422,7 +533,7 @@ struct LocalTime {
 
 fn local_time(epoch: i64) -> LocalTime {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t = epoch as libc::time_t;
+    let t = epoch;
     unsafe { libc::localtime_r(&t, &mut tm) };
     LocalTime {
         year: tm.tm_year + 1900,

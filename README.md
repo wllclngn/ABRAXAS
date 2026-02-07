@@ -11,22 +11,22 @@ A daemon available in C23 or Rust that smoothly adjusts your screen's color temp
 - **Weather Awareness (US, optional)**: NOAA api.weather.gov cloud cover shifts daytime target (6500K clear, 4500K overcast). See [Build & Install](#build--install) for international builds
 - **Manual Override**: `--set TEMP MINUTES` with the same sigmoid curve, auto-resumes at next transition window
 
-### libmeridian (Gamma Control)
+### Gamma Control (libmeridian / gamma module)
 - **4 Backends**: Wayland (wlr-gamma-control), GNOME (Mutter DBus), DRM (kernel ioctl), X11 (RandR)
 - **Auto-Detection**: Runtime probe based on `$WAYLAND_DISPLAY`, compositor availability, DRM access
 - **Per-Backend Diagnostics**: Each backend logs why it succeeded or failed during probe
-- **Runtime Loading**: X11 and GNOME backends load libraries via dlopen. Wayland backend is a separate .so plugin. CLI commands load zero backend code.
+- **Runtime Loading** (C23): X11 and GNOME backends load libraries via dlopen. Wayland backend is a separate .so plugin. CLI commands load zero backend code.
 - **Blackbody Ramp**: Planckian locus approximation, 1000K-25000K
 
 ### Daemon Reliability
 - **PID File Liveness**: Daemon writes PID on start, CLI commands check liveness before reporting success
 - **Instant Startup**: Gamma applied before weather init -- screen is correct on first frame
-- **io_uring Event Loop** (C23): 1 syscall per 60s tick via `IORING_OP_POLL_ADD` + `IORING_OP_TIMEOUT`. Automatic fallback to select()+timerfd on older kernels
+- **io_uring Event Loop**: Both C23 and Rust use raw io_uring syscalls. 1 `io_uring_enter` per 60s tick via `IORING_OP_POLL_ADD` + `IORING_OP_TIMEOUT`. Requires kernel >= 5.1
 - **inotify**: Config file hot-reload via IN_CLOSE_WRITE (no spurious partial-write triggers)
 - **signalfd**: Clean SIGTERM/SIGINT shutdown
-- **seccomp-bpf** (C23): ~75 whitelisted syscalls, KILL_PROCESS on violation. Raw BPF, no libseccomp
-- **landlock** (C23): Filesystem sandboxed to config dir, /dev, /proc, /usr, /etc, /lib, /tmp
-- **prctl hardening** (C23): 1ns timer slack, no-new-privs, non-dumpable
+- **seccomp-bpf**: Both C23 and Rust. ~81 whitelisted syscalls, KILL_PROCESS on violation. Raw BPF, no libseccomp
+- **landlock**: Both C23 and Rust. Filesystem sandboxed to config dir, /dev, /proc, /usr, /etc, /lib, /tmp. Raw syscalls, no libc wrappers
+- **prctl hardening**: Both C23 and Rust. 1ns timer slack, no-new-privs, non-dumpable
 - **Temperature Logging**: Every tick logs current mode, temperature, sun position, and cloud cover to stderr
 - **Zero Polling**: CPU usage ~180ms over 3 hours
 
@@ -35,6 +35,11 @@ A daemon available in C23 or Rust that smoothly adjusts your screen's color temp
 - **Compile-Time Safety**: `constexpr`, `[[nodiscard]]`, `static_assert`, `nullptr`, native `bool`
 - **Zero Warnings**: `-std=c2x -Wall -Wextra -Wpedantic`
 - **Zero Dependencies**: Binary loads only libc and libm. Weather via `posix_spawnp("curl")`. Backend libraries loaded on demand via dlopen.
+
+### Rust
+- **Zero Warnings**: Both glibc and musl targets compile warning-free
+- **Musl Static Build**: `x86_64-unknown-linux-musl` target produces a 612 KB static-pie binary with zero shared libraries (DRM-only)
+- **Weather via curl(1)**: `Command::new("curl")`, same approach as C23. No HTTP crate dependency.
 
 ---
 
@@ -52,6 +57,7 @@ A daemon available in C23 or Rust that smoothly adjusts your screen's color temp
 | DRM kernel gamma | No (X11 only) | No | Yes (direct ioctl) |
 | Wayland native | No | No | Yes (wlr-gamma-control + Mutter DBus) |
 | NVIDIA support | Via X11 | N/A | X11/RandR fallback |
+| Kernel sandbox | No | No | seccomp-bpf + landlock (both implementations) |
 | Dependencies | geoclue, X11 | cron, redshift | libc, libm (all backends runtime-loaded) |
 | Scheduler needed | Yes | Is the scheduler | No |
 
@@ -64,56 +70,54 @@ Both implementations produce the same `abraxas` binary, same CLI interface, same
 |                  | C23                | Rust               |
 |------------------|--------------------|--------------------|
 | Compiler         | GCC 15 (-std=c2x)  | rustc 1.75+        |
-| Source LOC        | ~5,900             | ~3,500             |
+| Source LOC        | ~5,800             | ~4,500             |
 | Memory model     | manual alloc/free  | ownership/borrow   |
 | Gamma: DRM       | raw ioctl          | raw ioctl          |
 | Gamma: Wayland   | .so plugin (dlopen)| wayland-client     |
 | Gamma: X11       | dlopen at runtime  | x11rb (pure Rust)  |
 | Gamma: GNOME     | dlopen at runtime  | libsystemd/sd-bus  |
-| Weather          | posix_spawnp curl(1)| ureq (5s timeout) |
+| Weather          | posix_spawnp curl(1)| Command::new curl(1) |
 | Config parse     | hand-rolled JSON   | serde_json         |
-| Event loop       | io_uring (1 syscall/tick) | poll() on 3 fds (2 syscalls/tick) |
-| Sandbox          | seccomp + landlock | none               |
-| LTO              | -flto=auto + gc-sections | cargo (default) |
-| Static build     | make static (musl) | N/A                |
+| Event loop       | io_uring (raw syscall) | io_uring (raw syscall) |
+| Sandbox          | seccomp + landlock | seccomp + landlock |
+| Hardening        | prctl              | prctl              |
+| LTO              | -flto=auto + gc-sections | opt-level=z, lto=true, strip, panic=abort |
+| Static build     | make static (musl) | cargo musl (static-pie) |
 | Heap allocs/tick | 0                  | 0                  |
 | Default backends | auto (pkg-config)  | noaa + x11 (cargo) |
 
 ### Measured Performance (test.py, 2026-02-06)
 
-|                     | C23          | Rust          | Notes                          |
-|---------------------|--------------|---------------|--------------------------------|
-| Binary size         | 69 KB        | 2,590 KB      | C23 wins: 37.5x smaller        |
-| Binary (static musl)| 121 KB       | N/A           | Zero shared libs, DRM-only     |
-| Shared libs (ldd)   | 3            | 5             | C23: libc, libm, ld-linux      |
-| Startup (--help)    | **0.6 ms**   | 0.9 ms        | **C23 wins: 1.5x faster**      |
-| --status            | **0.7 ms**   | 1.1 ms        | **C23 wins: 1.6x faster**      |
-| --set               | **0.7 ms**   | 1.0 ms        | **C23 wins: 1.4x faster**      |
-| Daemon memory       | **648 KB**   | ~14 MB        | **C23 wins: 22x less memory**  |
-| Daemon peak memory  | 2.6 MB       | ~14 MB        | Peak during startup (dlopen)   |
-| Syscalls/tick       | **1**        | 2             | io_uring vs poll+read          |
-| Daemon threads      | 1            | 1             | Tie                            |
-| CPU / hour          | < 1s         | < 1s          | Tie                            |
-| Weather timeout     | 5s per req   | 5s per req    | Tie                            |
+|                     | C23          | Rust (glibc)  | Rust (musl)    |
+|---------------------|--------------|---------------|----------------|
+| Binary size         | **69 KB**    | 598 KB        | 612 KB         |
+| Linking             | dynamic      | dynamic       | static-pie     |
+| Shared libs (ldd)   | 3            | 4             | 0              |
+| Startup (--help)    | 0.6 ms       | 1.0 ms        | **0.3 ms**     |
+| --status            | **0.7 ms**   | 0.9 ms        | --             |
+| --set               | **0.7 ms**   | 0.8 ms        | --             |
+| Syscalls/tick       | 1            | 1             | 1              |
+| Daemon threads      | 1            | 1             | 1              |
+| CPU / hour          | < 1s         | < 1s          | < 1s           |
+| Weather timeout     | 5s per req   | 5s per req    | 5s per req     |
 
-### v4.0.0 -> v4.1.0: How C23 Won
+### Strace Syscall Audit (verified via `strace -f -c`)
 
-In v4.0.0, C23 linked 36 shared libraries at startup (libcurl's SSL/crypto chain + X11 + Wayland + systemd). Rust statically compiled everything into a single binary with only 4 shared libs. Result: Rust was 4.9x faster at startup (0.8ms vs 3.9ms).
+|                     | C23          | Rust          |
+|---------------------|--------------|---------------|
+| Unique syscalls     | 54           | 62            |
+| Total invocations   | 601          | 1,208         |
+| io_uring_enter      | present      | present       |
+| io_uring_setup      | present      | present       |
+| landlock_*          | present      | present       |
+| select/timerfd      | **absent**   | **absent**    |
+| seccomp survived    | yes (6s)     | yes (6s)      |
 
-v4.1.0 eliminated every unnecessary dependency:
-
-| Step | Shared libs | --help time | What changed |
-|------|-------------|-------------|-------------|
-| v4.0.0 | 36 | 3.9 ms | Everything linked at compile time |
-| Drop libcurl | 15 | 2.0 ms | HTTP via posix_spawnp("curl") instead of libcurl |
-| dlopen X11 + GNOME | 5 | ~1 ms | Backend libs loaded on demand, not at startup |
-| Wayland .so plugin | 3 | 0.7 ms | Wayland backend in separate meridian_wl.so |
-
-The final C23 binary links only libc and libm. The dynamic linker resolves 3 libraries instead of 36. Backend libraries are loaded via dlopen only when the daemon actually probes for a display backend -- CLI commands like `--help`, `--status`, and `--set` never touch them.
+Rust's higher invocation count comes from its runtime (futex, clone3, eventfd2, pipe2, sigaltstack, sched_getaffinity). Both share the same kernel primitive set: io_uring, landlock, signalfd, inotify, prctl.
 
 ### Test Suite
 
-69 tests pass, 1 build warning check (pre-existing daemon.c FORTIFY_SOURCE diagnostic -- not a code error), 0 skipped. Full cross-compatibility verified: C23-written config and override files are correctly read by Rust and vice versa. Solar calculations agree to within 0K temperature, identical sunrise/sunset times, and matching sun elevation.
+97 tests: 88 pass, 0 fail, 9 skip. The 9 skips are Rust-musl daemon/strace tests (DRM-only binary has no gamma backend on X11 desktop sessions). Full cross-compatibility verified: C23-written config and override files are correctly read by Rust and vice versa. Solar calculations agree to within 0K temperature, identical sunrise/sunset times, and matching sun elevation.
 
 ## Architecture
 
@@ -122,7 +126,7 @@ ABRAXAS/
   c23/              C23 implementation
   rust/             Rust implementation
   install.py        Installer (prompts C23 or Rust)
-  test.py           Head-to-head test suite (70 tests)
+  test.py           Head-to-head test suite (97 tests, 3-way comparison)
   abraxas.service   Systemd user service
   us_zipcodes.bin   ZIP code database (shared)
 ```
@@ -136,6 +140,10 @@ abraxas (C23, single binary -- libmeridian statically linked)
     +-- Weather from api.weather.gov (posix_spawnp curl, 5s timeout)
     +-- Sigmoid transition engine
     +-- Custom RFC 8259 JSON parser (no vendored code)
+    +-- io_uring event loop (raw syscalls)
+    +-- seccomp-bpf filter (~81 whitelisted syscalls)
+    +-- landlock filesystem sandbox (raw syscalls)
+    +-- prctl hardening (timerslack, no_new_privs, !dumpable)
     |
     +-- libmeridian.a (C23, statically linked)
     |       |
@@ -156,9 +164,13 @@ abraxas (C23, single binary -- libmeridian statically linked)
 abraxas (Rust, single binary -- all backends compiled in via cargo features)
     |
     +-- NOAA sun ephemeris (same algorithm, std::f64)
-    +-- Weather from api.weather.gov (ureq)
+    +-- Weather from api.weather.gov (Command::new curl, 5s timeout)
     +-- Sigmoid transition engine (same curve)
     +-- Config via serde_json
+    +-- io_uring event loop (raw syscalls, same as C23)
+    +-- seccomp-bpf filter (~81 whitelisted syscalls, same as C23)
+    +-- landlock filesystem sandbox (raw syscalls, same as C23)
+    +-- prctl hardening (same as C23)
     |
     +-- gamma module (no FFI to libmeridian)
             |
@@ -227,7 +239,7 @@ The manual call communicates with the running daemon via a control file (watched
 
 Every 15 minutes, ABRAXAS fetches the hourly forecast from `api.weather.gov` (NOAA, US only). If cloud cover exceeds 75%, daytime temperature drops from 6500K to 4500K ("dark mode"). This prevents eye strain on overcast days when the ambient light is already dim.
 
-The weather API requires no API key. Rate limits are generous (per User-Agent). Each request has a 5-second timeout (max 10s for both NOAA requests combined). C23 execs curl(1) via posix_spawnp (no libcurl linkage). Rust uses the ureq crate.
+The weather API requires no API key. Rate limits are generous (per User-Agent). Each request has a 5-second timeout (max 10s for both NOAA requests combined). Both implementations exec curl(1) for HTTP requests (C23 via posix_spawnp, Rust via Command::new). No HTTP library dependency.
 
 ## Installation
 
@@ -240,7 +252,7 @@ pacman -S gcc make pkg-config
 # Rust: cargo
 pacman -S rustup && rustup default stable
 
-# Optional: curl binary (C23 weather -- usually pre-installed)
+# Optional: curl binary (weather -- usually pre-installed)
 pacman -S curl
 
 # Optional: Wayland backend
@@ -280,6 +292,10 @@ cp c23/meridian_wl.so ~/.local/bin/     # Wayland plugin (if built)
 # Or manually (Rust):
 cd rust && cargo build --release        # Defaults: noaa + x11
 cp target/release/abraxas ~/.local/bin/
+
+# Rust musl static build (DRM-only, no X11/Wayland/GNOME):
+cd rust && cargo build --release --target x86_64-unknown-linux-musl \
+    --no-default-features --features noaa
 ```
 
 ### Setup
@@ -408,7 +424,7 @@ See `libmeridian/include/meridian.h` for the full API.
 
 ## Platform Support
 
-- **Linux only**.
+- **Linux only**. Requires kernel >= 5.1 (io_uring).
 - **Wayland (wlr)**: Native gamma control on Sway, Hyprland, river, labwc, wayfire, niri
 - **GNOME Wayland**: Mutter DBus gamma control (Debian, Ubuntu, Fedora defaults)
 - **AMD/Intel/Nouveau**: DRM backend (pure kernel, no compositor needed)

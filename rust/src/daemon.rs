@@ -1,26 +1,27 @@
 //! Daemon event loop.
 //!
-//! Linux kernel interfaces: timerfd (60s tick), inotify (config changes),
-//! signalfd (clean shutdown via SIGTERM/SIGINT). All multiplexed with poll().
-//! Gamma control via auto-detected backend.
+//! Linux kernel interfaces: io_uring (60s timeout + poll), inotify (config
+//! changes), signalfd (clean shutdown via SIGTERM/SIGINT). Single
+//! io_uring_enter per tick. Gamma control via auto-detected backend.
 
 use crate::config::{self, Location, Paths, WeatherData};
 use crate::{
     sigmoid, solar, weather, CLOUD_THRESHOLD, TEMP_UPDATE_SEC, now_epoch,
+    landlock, seccomp,
 };
 use crate::gamma;
+use crate::uring::{self, AbraxasRing, KernelTimespec};
 
 use std::ffi::CString;
 
 const GAMMA_INIT_MAX_RETRIES: i32 = 60;
 const GAMMA_INIT_RETRY_MS: u64 = 500;
 
-/// Event discrimination from poll/inotify
+/// Event discrimination from inotify
 #[derive(Default)]
 struct EventResult {
     override_changed: bool,
     config_changed: bool,
-    signal_received: bool,
 }
 
 /// Full daemon runtime state
@@ -45,26 +46,6 @@ struct DaemonState {
 }
 
 // --- Linux kernel fd helpers ---
-
-/// Create a timerfd with the given interval in seconds.
-fn setup_timerfd(interval_secs: i64) -> i32 {
-    let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
-    if fd < 0 {
-        return -1;
-    }
-
-    let spec = libc::itimerspec {
-        it_interval: libc::timespec { tv_sec: interval_secs, tv_nsec: 0 },
-        it_value: libc::timespec { tv_sec: interval_secs, tv_nsec: 0 },
-    };
-
-    if unsafe { libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) } < 0 {
-        unsafe { libc::close(fd) };
-        return -1;
-    }
-
-    fd
-}
 
 /// Set up inotify watching the config directory for file writes.
 fn setup_inotify(paths: &Paths) -> i32 {
@@ -120,77 +101,6 @@ fn setup_signalfd() -> i32 {
     }
 }
 
-/// Poll on timerfd + inotify + signalfd. Parse inotify events to determine
-/// which config files changed. Returns immediately on signal or inotify event,
-/// otherwise blocks until timerfd fires (or timeout_secs if no timerfd).
-fn wait_for_event(
-    timer_fd: i32,
-    ino_fd: i32,
-    signal_fd: i32,
-    timeout_secs: i64,
-    paths: &Paths,
-) -> EventResult {
-    let mut pfds: [libc::pollfd; 3] = unsafe { std::mem::zeroed() };
-    let mut nfds: usize = 0;
-    let mut timer_idx = usize::MAX;
-    let mut ino_idx = usize::MAX;
-    let mut sig_idx = usize::MAX;
-
-    if timer_fd >= 0 {
-        timer_idx = nfds;
-        pfds[nfds] = libc::pollfd { fd: timer_fd, events: libc::POLLIN as i16, revents: 0 };
-        nfds += 1;
-    }
-    if ino_fd >= 0 {
-        ino_idx = nfds;
-        pfds[nfds] = libc::pollfd { fd: ino_fd, events: libc::POLLIN as i16, revents: 0 };
-        nfds += 1;
-    }
-    if signal_fd >= 0 {
-        sig_idx = nfds;
-        pfds[nfds] = libc::pollfd { fd: signal_fd, events: libc::POLLIN as i16, revents: 0 };
-        nfds += 1;
-    }
-
-    // If timerfd available, block indefinitely (timer provides the wake).
-    // Otherwise fall back to poll timeout.
-    let timeout_ms = if timer_fd >= 0 { -1 } else { (timeout_secs * 1000) as libc::c_int };
-
-    if nfds > 0 {
-        unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
-    } else {
-        std::thread::sleep(std::time::Duration::from_secs(timeout_secs as u64));
-    }
-
-    let mut result = EventResult::default();
-
-    // Drain timerfd
-    if timer_idx < nfds && pfds[timer_idx].revents & libc::POLLIN as i16 != 0 {
-        let mut exp: u64 = 0;
-        unsafe { libc::read(timer_fd, &mut exp as *mut u64 as *mut libc::c_void, 8) };
-    }
-
-    // Check signalfd
-    if sig_idx < nfds && pfds[sig_idx].revents & libc::POLLIN as i16 != 0 {
-        let mut buf = [0u8; 128]; // sizeof(signalfd_siginfo) = 128
-        unsafe { libc::read(signal_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        result.signal_received = true;
-    }
-
-    // Parse inotify events -- discriminate which file changed
-    if ino_idx < nfds && pfds[ino_idx].revents & libc::POLLIN as i16 != 0 {
-        let mut buf = [0u8; 4096];
-        let len = unsafe {
-            libc::read(ino_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
-        if len > 0 {
-            parse_inotify_events(&buf[..len as usize], paths, &mut result);
-        }
-    }
-
-    result
-}
-
 /// Parse inotify event buffer, comparing each event's filename against known
 /// config files. Sets override_changed / config_changed accordingly.
 fn parse_inotify_events(buf: &[u8], paths: &Paths, result: &mut EventResult) {
@@ -239,7 +149,7 @@ struct LocalTime {
 
 fn local_time(epoch: i64) -> LocalTime {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t = epoch as libc::time_t;
+    let t = epoch;
     unsafe { libc::localtime_r(&t, &mut tm) };
     LocalTime {
         hour: tm.tm_hour,
@@ -266,6 +176,88 @@ fn solar_temperature(now: i64, lat: f64, lon: f64, weather: &Option<WeatherData>
     };
 
     sigmoid::calculate_solar_temp(min_from_sunrise, min_to_sunset, is_dark)
+}
+
+/// io_uring event loop: single io_uring_enter per tick.
+fn event_loop_uring(
+    state: &mut DaemonState,
+    ring: &mut AbraxasRing,
+    ino_fd: i32,
+    signal_fd: i32,
+) {
+    let ts = KernelTimespec {
+        tv_sec: TEMP_UPDATE_SEC,
+        tv_nsec: 0,
+    };
+
+    loop {
+        // Submit: poll both fds + timeout
+        if ino_fd >= 0 {
+            ring.prep_poll(ino_fd, uring::EV_INOTIFY);
+        }
+        if signal_fd >= 0 {
+            ring.prep_poll(signal_fd, uring::EV_SIGNAL);
+        }
+        ring.prep_timeout(&ts, uring::EV_TIMEOUT);
+
+        let ret = ring.submit_and_wait();
+        if ret < 0 {
+            break;
+        }
+
+        // Process completions
+        let mut timer_expired = false;
+        let mut got_signal = false;
+        let mut event = EventResult::default();
+
+        while let Some(cqe) = ring.peek_cqe() {
+            match cqe.user_data {
+                uring::EV_TIMEOUT => timer_expired = true,
+                uring::EV_SIGNAL => got_signal = true,
+                uring::EV_INOTIFY => {
+                    if cqe.res > 0 {
+                        parse_inotify_fd(ino_fd, &state.paths, &mut event);
+                    }
+                }
+                uring::EV_CANCEL => {}
+                _ => {}
+            }
+            ring.cqe_seen();
+        }
+
+        // If we woke early (inotify/signal), cancel the pending timeout
+        if !timer_expired {
+            ring.prep_cancel(uring::EV_TIMEOUT, uring::EV_CANCEL);
+            ring.submit_and_wait();
+            // Drain cancel completion
+            while ring.peek_cqe().is_some() {
+                ring.cqe_seen();
+            }
+        }
+
+        if got_signal {
+            // Drain signalfd
+            if signal_fd >= 0 {
+                let mut buf = [0u8; 128];
+                unsafe {
+                    libc::read(signal_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                }
+            }
+            eprintln!("\nReceived shutdown signal...");
+            break;
+        }
+
+        tick(state, &event);
+    }
+}
+
+/// Read and parse inotify events from fd (used by io_uring path).
+fn parse_inotify_fd(fd: i32, paths: &Paths, result: &mut EventResult) {
+    let mut buf = [0u8; 4096];
+    let len = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if len > 0 {
+        parse_inotify_events(&buf[..len as usize], paths, result);
+    }
 }
 
 pub fn run(location: Location, paths: &Paths) {
@@ -307,7 +299,6 @@ pub fn run(location: Location, paths: &Paths) {
     };
 
     // Create kernel fds
-    let timer_fd = setup_timerfd(TEMP_UPDATE_SEC);
     let ino_fd = setup_inotify(&state.paths);
     let signal_fd = setup_signalfd();
 
@@ -316,17 +307,32 @@ pub fn run(location: Location, paths: &Paths) {
         eprintln!("[warn] Failed to write PID file: {}", e);
     }
 
-    eprintln!(
-        "[abraxas] daemon started (backend: {}, timerfd: {}, inotify: {}, signalfd: {})",
-        state
-            .gamma
-            .as_ref()
-            .map(|g| g.backend_name())
-            .unwrap_or("none"),
-        if timer_fd >= 0 { "active" } else { "unavailable" },
-        if ino_fd >= 0 { "active" } else { "unavailable" },
-        if signal_fd >= 0 { "active" } else { "unavailable" },
-    );
+    // prctl hardening
+    unsafe {
+        libc::prctl(libc::PR_SET_TIMERSLACK, 1); // 1ns timer precision
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); // required for seccomp
+        libc::prctl(libc::PR_SET_DUMPABLE, 0); // no core dumps, no ptrace
+    }
+    eprintln!("[kernel] prctl: timerslack=1ns, no_new_privs, !dumpable");
+
+    // Landlock filesystem sandbox
+    let config_dir = state.paths.override_file.parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !config_dir.is_empty() {
+        if landlock::install_sandbox(&config_dir) {
+            eprintln!("[kernel] landlock: filesystem sandbox active");
+        } else {
+            eprintln!("[kernel] landlock: unavailable (running unsandboxed)");
+        }
+    }
+
+    // seccomp-bpf syscall whitelist (must be last -- no new syscalls after this)
+    if seccomp::install_filter() {
+        eprintln!("[kernel] seccomp: syscall whitelist active (~81 syscalls)");
+    } else {
+        eprintln!("[kernel] seccomp: failed to install filter");
+    }
 
     // Recover from active override on restart
     recover_override(&mut state);
@@ -337,14 +343,21 @@ pub fn run(location: Location, paths: &Paths) {
     // Initialize weather subsystem
     weather::init();
 
-    // Event loop
-    loop {
-        let event = wait_for_event(timer_fd, ino_fd, signal_fd, TEMP_UPDATE_SEC, &state.paths);
-        if event.signal_received {
-            break;
+    // io_uring event loop (no fallback -- requires kernel >= 5.1)
+    let mut ring = match AbraxasRing::init(8) {
+        Some(r) => r,
+        None => {
+            eprintln!("[fatal] io_uring_setup failed (kernel >= 5.1 required)");
+            std::process::exit(1);
         }
-        tick(&mut state, &event);
-    }
+    };
+    eprintln!(
+        "[abraxas] daemon started (backend: {}, io_uring: active, inotify: {}, signalfd: {})",
+        state.gamma.as_ref().map(|g| g.backend_name()).unwrap_or("none"),
+        if ino_fd >= 0 { "active" } else { "unavailable" },
+        if signal_fd >= 0 { "active" } else { "unavailable" },
+    );
+    event_loop_uring(&mut state, &mut ring, ino_fd, signal_fd);
 
     // Clean shutdown
     eprintln!("[abraxas] shutting down...");
@@ -354,7 +367,6 @@ pub fn run(location: Location, paths: &Paths) {
     }
     config::remove_pid(&state.paths);
 
-    if timer_fd >= 0 { unsafe { libc::close(timer_fd) }; }
     if ino_fd >= 0 { unsafe { libc::close(ino_fd) }; }
     if signal_fd >= 0 { unsafe { libc::close(signal_fd) }; }
 }

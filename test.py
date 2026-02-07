@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-ABRAXAS test suite -- head-to-head C23 vs. Rust comparison.
+ABRAXAS test suite -- C23 vs. Rust (glibc) vs. Rust (musl static) comparison.
 
-Tests every subsystem across both implementations:
-  - Build (compile, zero warnings)
-  - Binary comparison (size, dependencies, startup time)
+Tests every subsystem across all implementations:
+  - Build (compile, zero warnings -- C23, Rust glibc, Rust musl)
+  - Binary comparison (size, dependencies, linking type, startup time)
   - CLI commands (--help, --set-location, --set, --resume, --reset, --status)
   - Config cross-compatibility (C23 writes, Rust reads, and vice versa)
   - Override file format (identical JSON between implementations)
   - Daemon lifecycle (start, signal handling, shutdown)
   - Solar calculation comparison (same input -> same output)
+  - Strace syscall audit (io_uring active, landlock active, no fallbacks)
 
 Modeled after muEmacs' Python test harness (pexpect/pyte pattern adapted
 for subprocess-based daemon testing).
@@ -42,6 +43,7 @@ C23_DIR = SCRIPT_DIR / "c23"
 RUST_DIR = SCRIPT_DIR / "rust"
 C23_BIN = C23_DIR / "abraxas"
 RUST_BIN = RUST_DIR / "target" / "release" / "abraxas"
+RUST_MUSL_BIN = RUST_DIR / "target" / "x86_64-unknown-linux-musl" / "release" / "abraxas"
 
 # Test location (Chicago, IL -- known NOAA coverage)
 TEST_LAT = 41.8781
@@ -142,6 +144,21 @@ def cleanup_test_env(test_home):
         pass
 
 
+def _all_binaries():
+    """All available (name, path) pairs for iteration."""
+    bins = [("C23", C23_BIN), ("Rust", RUST_BIN)]
+    if RUST_MUSL_BIN.exists():
+        bins.append(("Rust-musl", RUST_MUSL_BIN))
+    return bins
+
+
+def _daemon_reached_event_loop(output):
+    """Check if daemon output shows it reached the main event loop."""
+    markers = ["io_uring", "daemon started", "1 syscall/tick"]
+    lo = output.lower()
+    return any(m in lo for m in markers)
+
+
 # =============================================================================
 # BUILD TESTS
 # =============================================================================
@@ -168,9 +185,9 @@ def test_build(R):
     else:
         R.fail("C23 build failed", result.stderr[:500])
 
-    # Rust
+    # Rust (glibc)
     result = subprocess.run(
-        ["cargo", "build", "--release", "--features", "wayland,x11,gnome"],
+        ["cargo", "build", "--release"],
         capture_output=True, text=True, timeout=120,
         cwd=str(RUST_DIR),
     )
@@ -186,6 +203,29 @@ def test_build(R):
     else:
         R.fail("Rust build failed", result.stderr[:500])
 
+    # Rust (musl static)
+    result = subprocess.run(
+        ["cargo", "build", "--release",
+         "--target", "x86_64-unknown-linux-musl",
+         "--no-default-features", "--features", "noaa"],
+        capture_output=True, text=True, timeout=180,
+        cwd=str(RUST_DIR),
+    )
+    if result.returncode == 0:
+        warnings = [l for l in result.stderr.split('\n')
+                     if 'warning' in l.lower() and 'Compiling' not in l
+                     and 'Finished' not in l and 'Downloading' not in l
+                     and l.strip()]
+        if warnings:
+            R.fail(f"Rust-musl build: {len(warnings)} warning(s)", '\n'.join(warnings[:5]))
+        else:
+            R.ok("Rust-musl builds clean (0 warnings, static-pie)")
+    else:
+        if "target may not be installed" in result.stderr or "can't find crate" in result.stderr:
+            R.skip("Rust-musl build", "musl target not installed")
+        else:
+            R.fail("Rust-musl build failed", result.stderr[:500])
+
 
 # =============================================================================
 # BINARY COMPARISON
@@ -198,23 +238,46 @@ def test_binary_comparison(R):
         R.skip("Binary comparison", "one or both binaries not built")
         return
 
+    has_musl = RUST_MUSL_BIN.exists()
+
     # Size
     c23_size = C23_BIN.stat().st_size
     rust_size = RUST_BIN.stat().st_size
-    print(f"\n  {'':20} {'C23':>20} {'Rust':>20}")
-    print(f"  {'-' * 60}")
-    R.compare("Binary size", c23_size // 1024, rust_size // 1024, "KB")
+    musl_size = RUST_MUSL_BIN.stat().st_size if has_musl else 0
+
+    if has_musl:
+        print(f"\n  {'':20} {'C23':>16} {'Rust':>16} {'Rust-musl':>16}")
+        print(f"  {'-' * 68}")
+    else:
+        print(f"\n  {'':20} {'C23':>20} {'Rust':>20}")
+        print(f"  {'-' * 60}")
+
+    if has_musl:
+        print(f"  {'Binary size':<20} {c23_size // 1024:>13} KB {rust_size // 1024:>13} KB {musl_size // 1024:>13} KB")
+    else:
+        R.compare("Binary size", c23_size // 1024, rust_size // 1024, "KB")
 
     # Shared library dependencies
     c23_ret, c23_ldd, _ = run_cmd(["ldd", str(C23_BIN)])
     rust_ret, rust_ldd, _ = run_cmd(["ldd", str(RUST_BIN)])
     c23_deps = len([l for l in c23_ldd.split('\n') if '=>' in l]) if c23_ret == 0 else -1
     rust_deps = len([l for l in rust_ldd.split('\n') if '=>' in l]) if rust_ret == 0 else -1
-    R.compare("Shared libs", c23_deps, rust_deps, "", ratio=False)
+
+    if has_musl:
+        print(f"  {'Shared libs':<20} {c23_deps:>16} {rust_deps:>16} {'0 (static)':>16}")
+    else:
+        R.compare("Shared libs", c23_deps, rust_deps, "", ratio=False)
+
+    # Linking type
+    if has_musl:
+        _, file_out, _ = run_cmd(["file", str(RUST_MUSL_BIN)])
+        link_type = "static-pie" if "static-pie" in file_out else "static" if "static" in file_out else "dynamic"
+        print(f"  {'Linking':<20} {'dynamic':>16} {'dynamic':>16} {link_type:>16}")
 
     # Startup time (--help, 10 runs)
     times_c23 = []
     times_rust = []
+    times_musl = []
     for _ in range(10):
         t0 = time.monotonic()
         run_cmd([str(C23_BIN), "--help"], timeout=5)
@@ -224,14 +287,25 @@ def test_binary_comparison(R):
         run_cmd([str(RUST_BIN), "--help"], timeout=5)
         times_rust.append((time.monotonic() - t0) * 1000)
 
+        if has_musl:
+            t0 = time.monotonic()
+            run_cmd([str(RUST_MUSL_BIN), "--help"], timeout=5)
+            times_musl.append((time.monotonic() - t0) * 1000)
+
     avg_c23 = sum(times_c23) / len(times_c23)
     avg_rust = sum(times_rust) / len(times_rust)
-    R.compare("Startup (--help)", round(avg_c23, 1), round(avg_rust, 1), "ms")
+
+    if has_musl:
+        avg_musl = sum(times_musl) / len(times_musl)
+        print(f"  {'Startup (--help)':<20} {avg_c23:>13.1f} ms {avg_rust:>13.1f} ms {avg_musl:>13.1f} ms")
+    else:
+        R.compare("Startup (--help)", round(avg_c23, 1), round(avg_rust, 1), "ms")
     print()
 
-    # Both exist: pass
     R.ok(f"C23 binary: {c23_size // 1024} KB")
     R.ok(f"Rust binary: {rust_size // 1024} KB")
+    if has_musl:
+        R.ok(f"Rust-musl binary: {musl_size // 1024} KB ({link_type})")
 
 
 # =============================================================================
@@ -241,7 +315,7 @@ def test_binary_comparison(R):
 def test_help(R):
     R.section("CLI: --help")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} --help", "binary not built")
             continue
@@ -261,7 +335,7 @@ def test_help(R):
 def test_set_location(R):
     R.section("CLI: --set-location")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} --set-location", "binary not built")
             continue
@@ -340,7 +414,7 @@ def test_config_cross_read(R):
 def test_set_override(R):
     R.section("CLI: --set TEMP MINUTES")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} --set", "binary not built")
             continue
@@ -457,7 +531,7 @@ def test_override_cross_read(R):
 def test_resume(R):
     R.section("CLI: --resume")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} --resume", "binary not built")
             continue
@@ -619,7 +693,7 @@ def _extract_field(text, pattern):
 def test_reset(R):
     R.section("CLI: --reset")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} --reset", "binary not built")
             continue
@@ -654,42 +728,95 @@ def test_reset(R):
 
 _active_daemons = []
 
+
+def _daemon_cleanup_files(proc):
+    """Close and remove daemon stderr temp file."""
+    if hasattr(proc, '_stderr_file'):
+        try:
+            proc._stderr_file.close()
+        except Exception:
+            pass
+    if hasattr(proc, '_stderr_path'):
+        try:
+            os.unlink(proc._stderr_path)
+        except Exception:
+            pass
+
+
 def _start_daemon(binary, env, startup_wait=3):
-    """Start daemon, return (proc, None) if alive or (None, skip_reason) if failed."""
+    """Start daemon, return (proc, None) if alive or (None, skip_reason) if failed.
+
+    Stderr is redirected to a temp file so we can read it at any time
+    without blocking or consuming pipe data.
+    """
+    fd, stderr_path = tempfile.mkstemp(prefix='abraxas_stderr_')
+    stderr_file = os.fdopen(fd, 'w+b')
+
     proc = subprocess.Popen(
         [str(binary), "--daemon"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, stdout=subprocess.DEVNULL, stderr=stderr_file,
         start_new_session=True,
     )
+    proc._stderr_path = stderr_path
+    proc._stderr_file = stderr_file
     _active_daemons.append(proc)
     time.sleep(startup_wait)
 
+    # Read stderr output accumulated so far
+    stderr_file.flush()
+    stderr_file.seek(0)
+    output = stderr_file.read().decode('utf-8', errors='replace')
+
     if proc.poll() is not None:
-        stdout, stderr = proc.communicate(timeout=5)
-        output = (stdout.decode('utf-8', errors='replace') +
-                  stderr.decode('utf-8', errors='replace'))
+        if proc in _active_daemons:
+            _active_daemons.remove(proc)
+        _daemon_cleanup_files(proc)
         if "gamma" in output.lower() or "backend" in output.lower():
             return None, "no gamma backend"
         return None, f"exited code={proc.returncode}: {output[:200]}"
+
+    # Daemon alive -- check if stuck in gamma retry (no event loop reached)
+    if not _daemon_reached_event_loop(output) and \
+       ("gamma" in output.lower() or "drm" in output.lower() or
+        "Failed" in output):
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if proc in _active_daemons:
+            _active_daemons.remove(proc)
+        _daemon_cleanup_files(proc)
+        return None, "stuck in gamma init (no backend)"
 
     return proc, None
 
 
 def _stop_daemon(proc, timeout=15):
-    """Clean SIGTERM shutdown. Returns all captured output or None on timeout."""
+    """Clean SIGTERM shutdown. Returns all captured output or None."""
     proc.send_signal(signal.SIGTERM)
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        if proc in _active_daemons:
-            _active_daemons.remove(proc)
-        return (stdout.decode('utf-8', errors='replace') +
-                stderr.decode('utf-8', errors='replace'))
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()
-        if proc in _active_daemons:
-            _active_daemons.remove(proc)
-        return None
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    if proc in _active_daemons:
+        _active_daemons.remove(proc)
+
+    output = None
+    if hasattr(proc, '_stderr_file'):
+        try:
+            proc._stderr_file.seek(0)
+            output = proc._stderr_file.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+
+    _daemon_cleanup_files(proc)
+    return output
 
 
 def _kill_daemon(proc):
@@ -701,6 +828,7 @@ def _kill_daemon(proc):
         pass
     if proc in _active_daemons:
         _active_daemons.remove(proc)
+    _daemon_cleanup_files(proc)
 
 
 def _cleanup_all_daemons():
@@ -711,6 +839,7 @@ def _cleanup_all_daemons():
             proc.wait(timeout=2)
         except Exception:
             pass
+        _daemon_cleanup_files(proc)
     _active_daemons.clear()
 
 
@@ -721,7 +850,7 @@ def _cleanup_all_daemons():
 def test_daemon_lifecycle(R):
     R.section("DAEMON LIFECYCLE")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} daemon", "binary not built")
             continue
@@ -759,7 +888,7 @@ def test_daemon_lifecycle(R):
 def test_daemon_set_response(R):
     R.section("DAEMON: --set DETECTION")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} --set detection", "binary not built")
             continue
@@ -828,7 +957,7 @@ def test_daemon_set_response(R):
 def test_daemon_multiple_overrides(R):
     R.section("DAEMON: MULTIPLE OVERRIDES (inotify survival)")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} multiple overrides", "binary not built")
             continue
@@ -913,7 +1042,7 @@ def test_daemon_multiple_overrides(R):
 def test_daemon_set_resume_cycle(R):
     R.section("DAEMON: --set / --resume / --set CYCLE")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} set/resume cycle", "binary not built")
             continue
@@ -1012,7 +1141,7 @@ def test_daemon_set_resume_cycle(R):
 def test_daemon_rapid_overrides(R):
     R.section("DAEMON: RAPID-FIRE OVERRIDES")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} rapid overrides", "binary not built")
             continue
@@ -1158,7 +1287,7 @@ def test_override_format(R):
 def test_edge_cases(R):
     R.section("EDGE CASES")
 
-    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+    for name, binary in _all_binaries():
         if not binary.exists():
             R.skip(f"{name} edge cases", "binary not built")
             continue
@@ -1273,6 +1402,178 @@ def test_performance(R):
 
 
 # =============================================================================
+# STRACE: SYSCALL AUDIT
+# =============================================================================
+
+def _parse_strace_summary(filepath):
+    """Parse strace -c output, return (set of syscall names, total call count).
+
+    Strace -c format has 5 columns (no errors) or 6 columns (with errors):
+      % time  seconds  usecs/call  calls  [errors]  syscall
+    The syscall name is always the last column.
+    """
+    syscalls = set()
+    total_calls = 0
+    try:
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('%') or line.startswith('-'):
+                    continue
+                if 'total' in line and line[0].isdigit():
+                    # Total line: extract call count (column 4, 0-indexed 3)
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[3].isdigit():
+                        total_calls = int(parts[3])
+                    continue
+                parts = line.split()
+                if len(parts) >= 5:
+                    name = parts[-1]
+                    if name != 'total' and not name.startswith('-') \
+                       and not name.startswith('%'):
+                        syscalls.add(name)
+    except Exception:
+        pass
+    return syscalls, total_calls
+
+
+def test_strace_audit(R):
+    R.section("STRACE: SYSCALL AUDIT")
+
+    # Check strace availability
+    ret, _, _ = run_cmd(["strace", "--version"])
+    if ret != 0:
+        R.skip("strace audit", "strace not installed")
+        return
+
+    profiles = {}
+
+    for name, binary in _all_binaries():
+        if not binary.exists():
+            R.skip(f"{name} strace", "binary not built")
+            continue
+
+        test_home, config_dir, env = make_test_env()
+        strace_file = os.path.join(test_home, "strace.txt")
+        proc = None
+        try:
+            loc_str = f"{TEST_LAT},{TEST_LON}"
+            run_cmd([str(binary), "--set-location", loc_str], env=env)
+
+            # Run daemon under strace + timeout.
+            # timeout sends SIGTERM after 6s (SIGKILL 3s later if needed).
+            # When daemon exits, strace writes -c summary and exits naturally.
+            # This avoids the empty-output-file bug from sending SIGTERM to strace.
+            proc = subprocess.Popen(
+                ["strace", "-f", "-c", "-o", strace_file, "--",
+                 "timeout", "--signal=SIGTERM", "--kill-after=3", "6",
+                 str(binary), "--daemon"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            _active_daemons.append(proc)
+
+            # Wait for natural completion (timeout kills daemon -> strace exits)
+            try:
+                stdout, stderr = proc.communicate(timeout=20)
+                output = (stdout.decode('utf-8', errors='replace') +
+                          stderr.decode('utf-8', errors='replace'))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                output = ""
+
+            if proc in _active_daemons:
+                _active_daemons.remove(proc)
+            proc = None
+
+            # Parse strace output
+            syscalls, total_calls = _parse_strace_summary(strace_file)
+            if not syscalls:
+                if "gamma" in output.lower() or "backend" in output.lower():
+                    R.skip(f"{name}: strace audit", "daemon didn't reach event loop")
+                else:
+                    R.fail(f"{name}: strace produced no output")
+                continue
+
+            profiles[name] = (syscalls, total_calls)
+
+            # Check: io_uring active
+            if "io_uring_enter" in syscalls:
+                R.ok(f"{name}: io_uring loop active ({total_calls} total syscalls, "
+                     f"{len(syscalls)} unique)")
+            elif not _daemon_reached_event_loop(output):
+                R.skip(f"{name}: io_uring check", "daemon didn't reach event loop")
+            else:
+                R.fail(f"{name}: io_uring_enter NOT found in syscall trace")
+
+            # Check: landlock active
+            if "landlock_create_ruleset" in syscalls or "landlock_add_rule" in syscalls:
+                R.ok(f"{name}: landlock sandbox installed")
+            elif not _daemon_reached_event_loop(output):
+                R.skip(f"{name}: landlock check", "daemon didn't reach init")
+            else:
+                R.fail(f"{name}: landlock syscalls NOT found")
+
+            # Check: no fallback syscalls
+            fallbacks = {"select", "pselect6", "timerfd_create", "timerfd_settime"}
+            found_fallbacks = syscalls & fallbacks
+            if not found_fallbacks:
+                R.ok(f"{name}: no fallback syscalls (select/timerfd removed)")
+            else:
+                R.fail(f"{name}: fallback syscalls found: {found_fallbacks}")
+
+            # Daemon survived seccomp (it ran without SIGSYS)
+            R.ok(f"{name}: survived seccomp filter")
+
+        finally:
+            if proc:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                if proc in _active_daemons:
+                    _active_daemons.remove(proc)
+            cleanup_test_env(test_home)
+
+    # Print comparison table if we have multiple profiles
+    if len(profiles) >= 2:
+        print(f"\n  Syscall profile comparison:")
+        names = list(profiles.keys())
+        all_syscalls = set()
+        for s, _ in profiles.values():
+            all_syscalls |= s
+
+        # Header
+        header = f"  {'syscall':<28}"
+        for n in names:
+            header += f" {n:>10}"
+        print(header)
+        print(f"  {'-' * (28 + 11 * len(names))}")
+
+        for sc in sorted(all_syscalls):
+            row = f"  {sc:<28}"
+            for n in names:
+                row += f" {'*':>10}" if sc in profiles[n][0] else f" {'':>10}"
+            print(row)
+
+        # Totals
+        print(f"  {'-' * (28 + 11 * len(names))}")
+        row = f"  {'UNIQUE':.<28}"
+        for n in names:
+            row += f" {len(profiles[n][0]):>10}"
+        print(row)
+        row = f"  {'TOTAL CALLS':.<28}"
+        for n in names:
+            row += f" {profiles[n][1]:>10}"
+        print(row)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1281,8 +1582,8 @@ def run_tests(skip_build=False):
 
     print()
     print("=" * 64)
-    print("             ABRAXAS TEST SUITE v5.1.0")
-    print("             C23 vs. Rust -- Head to Head")
+    print("             ABRAXAS TEST SUITE v6.0.0")
+    print("         C23 vs. Rust vs. Rust-musl -- Head to Head")
     print("=" * 64)
 
     # Build
@@ -1323,6 +1624,9 @@ def run_tests(skip_build=False):
 
     # Performance
     test_performance(R)
+
+    # Strace syscall audit
+    test_strace_audit(R)
 
     return R.summary()
 

@@ -6,6 +6,7 @@
 //!   2. GET that URL
 //!      -> extract first period's shortForecast, temperature, isDaytime
 //!
+//! Uses curl(1) child process for HTTP -- zero TLS dependencies.
 //! When compiled without the "noaa" feature, all functions are no-ops.
 
 use crate::config::WeatherData;
@@ -33,29 +34,29 @@ pub fn fetch(lat: f64, lon: f64) -> WeatherData {
 }
 
 #[cfg(feature = "noaa")]
-fn get_agent() -> &'static ureq::Agent {
-    use std::sync::OnceLock;
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_read(std::time::Duration::from_secs(5))
-            .timeout_write(std::time::Duration::from_secs(5))
-            .user_agent("abraxas/4.1 (weather color temp daemon)")
-            .build()
-    })
+fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("curl")
+        .args([
+            "-s", "-f", "-L", "--max-time", "5",
+            "-H", "User-Agent: abraxas/6.0 (weather color temp daemon)",
+            "-H", "Accept: application/geo+json",
+            url,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!("curl exit {}", output.status).into());
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| e.into())
 }
 
 #[cfg(feature = "noaa")]
 fn fetch_inner(lat: f64, lon: f64) -> Result<WeatherData, Box<dyn std::error::Error>> {
-    let agent = get_agent();
-
     // Step 1: Get grid point
     let url = format!("https://api.weather.gov/points/{:.4},{:.4}", lat, lon);
-    let resp: serde_json::Value = agent
-        .get(&url)
-        .set("Accept", "application/geo+json")
-        .call()?
-        .into_json()?;
+    let body = http_get(&url)?;
+    let resp: serde_json::Value = serde_json::from_str(&body)?;
 
     let forecast_url = resp["properties"]["forecastHourly"]
         .as_str()
@@ -63,11 +64,8 @@ fn fetch_inner(lat: f64, lon: f64) -> Result<WeatherData, Box<dyn std::error::Er
         .to_string();
 
     // Step 2: Get hourly forecast
-    let resp: serde_json::Value = agent
-        .get(&forecast_url)
-        .set("Accept", "application/geo+json")
-        .call()?
-        .into_json()?;
+    let body = http_get(&forecast_url)?;
+    let resp: serde_json::Value = serde_json::from_str(&body)?;
 
     let period = &resp["properties"]["periods"][0];
     if period.is_null() {

@@ -30,8 +30,11 @@ pub enum Error {
     Gamma,
     NoCrtc,
     Permission,
+    #[cfg(feature = "wayland")]
     WaylandConnect,
+    #[cfg(feature = "wayland")]
     WaylandProtocol,
+    #[cfg(feature = "gnome")]
     GnomeDbus,
 }
 
@@ -45,8 +48,11 @@ impl fmt::Display for Error {
             Error::Gamma => write!(f, "Failed to set gamma ramp"),
             Error::NoCrtc => write!(f, "No usable CRTC found"),
             Error::Permission => write!(f, "Permission denied (need video group?)"),
+            #[cfg(feature = "wayland")]
             Error::WaylandConnect => write!(f, "Failed to connect to Wayland display"),
+            #[cfg(feature = "wayland")]
             Error::WaylandProtocol => write!(f, "Wayland compositor lacks gamma control protocol"),
+            #[cfg(feature = "gnome")]
             Error::GnomeDbus => write!(f, "Failed to communicate with Mutter via DBus"),
         }
     }

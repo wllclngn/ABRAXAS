@@ -13,10 +13,12 @@ Comprehensive guide to catching bugs at compile-time, runtime, and with tooling.
    - Compatibility Layer Pattern
 2. [Runtime Crash Handling](#runtime-crash-handling)
    - Fatal Signal Handlers, Operational Signal Architecture (Flag-Based)
-3. [Memory Safety Tools](#memory-safety-tools)
-4. [Static Analysis](#static-analysis)
-5. [Quick Reference](#quick-reference)
-6. [Checklist](#checklist)
+3. [Kernel Sandboxing](#kernel-sandboxing)
+   - seccomp-bpf, landlock, Privilege Dropping Pattern, Syscall Auditing
+4. [Memory Safety Tools](#memory-safety-tools)
+5. [Static Analysis](#static-analysis)
+6. [Quick Reference](#quick-reference)
+7. [Checklist](#checklist)
 
 ---
 
@@ -898,6 +900,390 @@ void install_crash_handler() {
 | [StackWalker](https://github.com/JochenKalmbach/StackWalker) | Windows | Single header |
 | [libunwind](https://www.nongnu.org/libunwind/) | Linux, macOS | Low-level, fast |
 | [Boost.Stacktrace](https://www.boost.org/doc/libs/release/doc/html/stacktrace.html) | Cross-platform | Part of Boost |
+
+---
+
+# Kernel Sandboxing
+
+Lock down a process after initialization. Defense-in-depth: even if an attacker
+gets code execution, the kernel restricts what syscalls they can make and what
+filesystem paths they can access.
+
+---
+
+## The Init/Runtime Split
+
+The most important pattern in kernel sandboxing: **initialize everything first,
+then drop privileges.** A daemon's lifecycle has two phases:
+
+```
+Phase 1: INIT (privileged)          Phase 2: RUNTIME (sandboxed)
+  - dlopen backend libraries          - event loop
+  - open sockets (X11, Wayland)       - read/write config files
+  - mmap shared memory                - set gamma (via open socket)
+  - read initial config               - spawn child processes
+  - create inotify/signalfd           - handle signals
+
+  ... then install:                   Kernel enforces restrictions:
+  1. landlock (filesystem)            - only whitelisted syscalls
+  2. seccomp (syscalls)               - only whitelisted paths
+```
+
+**Order matters.** Install landlock before seccomp. Landlock setup requires
+`landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` --
+if seccomp is installed first, these syscalls would need to be whitelisted
+(and they're one-time-use, so whitelisting them permanently widens the attack
+surface for no reason).
+
+---
+
+## seccomp-bpf (Syscall Whitelist)
+
+Restricts a process to a set of allowed syscalls. Uses Berkeley Packet Filter
+(BPF) programs evaluated by the kernel on every syscall entry.
+
+### Architecture
+
+```c
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+
+/* BPF macro for allowing a single syscall */
+#define ALLOW_SYSCALL(nr) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+
+struct sock_filter filter[] = {
+    /* 1. Load architecture from seccomp_data */
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+             offsetof(struct seccomp_data, arch)),
+
+    /* 2. Verify x86_64 -- kill if wrong arch (prevents ABI confusion) */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+
+    /* 3. Load syscall number */
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+             offsetof(struct seccomp_data, nr)),
+
+    /* 4. Whitelist */
+    ALLOW_SYSCALL(__NR_read),
+    ALLOW_SYSCALL(__NR_write),
+    ALLOW_SYSCALL(__NR_openat),
+    ALLOW_SYSCALL(__NR_close),
+    /* ... all needed syscalls ... */
+
+    /* 5. Default: kill */
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+};
+
+struct sock_fprog prog = {
+    .len    = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+    .filter = filter,
+};
+
+/* Requires PR_SET_NO_NEW_PRIVS first */
+prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+```
+
+### Return Actions
+
+| Action | Effect | Use Case |
+|--------|--------|----------|
+| `SECCOMP_RET_ALLOW` | Syscall proceeds | Whitelisted syscalls |
+| `SECCOMP_RET_KILL_PROCESS` | Entire process killed (SIGSYS) | Production |
+| `SECCOMP_RET_KILL_THREAD` | Only calling thread killed | Rare |
+| `SECCOMP_RET_TRAP` | SIGSYS delivered with `si_syscall` info | Debugging |
+| `SECCOMP_RET_LOG` | Syscall proceeds, violation logged | **Development** |
+| `SECCOMP_RET_ERRNO(n)` | Syscall returns `-1` with `errno = n` | Graceful denial |
+
+### Development Workflow (CRITICAL)
+
+**Never ship `SECCOMP_RET_KILL_PROCESS` on your first attempt.** Use this
+iterative process:
+
+**Step 1: Audit with strace**
+
+```bash
+# Trace all syscalls the program makes
+strace -f -o /tmp/trace.log ./program --daemon &
+sleep 5 && kill $!
+
+# Extract unique syscall names
+awk -F'(' '{print $1}' /tmp/trace.log | sed 's/^[0-9]* *//' | \
+    grep -v '^[+-]' | grep -v '^\-\-\-' | sort -u
+```
+
+Exercise every code path: startup, normal operation, config reload, weather
+fetch, override set/resume, clean shutdown. Every code path uses different
+syscalls.
+
+**Step 2: Start with SECCOMP_RET_LOG**
+
+```c
+/* Development: log violations without killing */
+BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_LOG),
+```
+
+Run the daemon, exercise it, then check the audit log:
+
+```bash
+# Check for violations (the syscalls you missed)
+journalctl -k | grep SECCOMP
+# or
+grep SECCOMP /var/log/audit/audit.log
+```
+
+Each log entry contains `syscall=NNN` -- that's the syscall number you need
+to add.
+
+**Step 3: Use SECCOMP_RET_TRAP for detailed debugging**
+
+```c
+#include <signal.h>
+
+static void sigsys_handler(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)ctx;
+    /* info->si_syscall = the blocked syscall number */
+    dprintf(STDERR_FILENO, "SECCOMP: blocked syscall %d\n",
+            info->si_syscall);
+    _exit(1);
+}
+
+/* Install before seccomp filter */
+struct sigaction sa = {
+    .sa_sigaction = sigsys_handler,
+    .sa_flags = SA_SIGINFO,
+};
+sigemptyset(&sa.sa_mask);
+sigaction(SIGSYS, &sa, NULL);
+```
+
+Then use `SECCOMP_RET_TRAP` instead of `SECCOMP_RET_KILL_PROCESS`. The
+handler fires with the exact syscall number before the process dies.
+
+**Step 4: Switch to SECCOMP_RET_KILL_PROCESS for production.**
+
+### Common Gotchas
+
+**Filters survive execve.** If your daemon spawns child processes (e.g.,
+`posix_spawnp("curl")`), the child inherits the seccomp filter. curl needs
+networking syscalls (`sendto`, `recvfrom`, `getaddrinfo`, etc.) that your
+daemon may not have whitelisted. Options:
+
+1. Whitelist the child's syscalls too (widens attack surface)
+2. Spawn children before installing seccomp (restructure init order)
+3. Use `SECCOMP_RET_ERRNO(ENOSYS)` instead of KILL for unknown syscalls
+   (child gets graceful errors instead of death)
+
+**glibc vs musl syscall differences.** glibc may use different underlying
+syscalls than you expect. `malloc` can trigger `mmap`, `mremap`, or `brk`.
+`printf` can trigger `write` and `fstat`. `dlopen` triggers `openat`, `mmap`,
+`mprotect`, `getdents64`. Always audit with strace, never assume.
+
+**Architecture check is required.** Without the `AUDIT_ARCH_X86_64` check,
+an attacker could use the 32-bit syscall ABI (via `int 0x80` on x86_64) where
+syscall numbers are different, bypassing your filter entirely.
+
+**io_uring has multiple syscalls.** `io_uring_setup` (creates the ring),
+`io_uring_enter` (submits/waits), `io_uring_register` (registers buffers).
+They are three separate syscall numbers. Whitelisting only `io_uring_enter`
+and forgetting `io_uring_setup` means the ring can never be created.
+
+---
+
+## landlock (Filesystem Sandbox)
+
+Restricts filesystem access to a set of allowed paths. No root required
+(unprivileged sandboxing). Available since Linux 5.13.
+
+### Architecture
+
+```c
+#include <linux/landlock.h>
+#include <sys/syscall.h>
+
+/* Landlock uses raw syscalls -- no libc wrappers exist */
+static int landlock_create_ruleset(
+    const struct landlock_ruleset_attr *attr, size_t size, uint32_t flags)
+{
+    return (int)syscall(__NR_landlock_create_ruleset, attr, size, flags);
+}
+
+static int landlock_add_rule(
+    int fd, enum landlock_rule_type type, const void *attr, uint32_t flags)
+{
+    return (int)syscall(__NR_landlock_add_rule, fd, type, attr, flags);
+}
+
+static int landlock_restrict_self(int fd, uint32_t flags)
+{
+    return (int)syscall(__NR_landlock_restrict_self, fd, flags);
+}
+```
+
+### Usage Pattern
+
+```c
+/* 1. Define what filesystem actions to restrict */
+struct landlock_ruleset_attr ruleset_attr = {
+    .handled_access_fs =
+        LANDLOCK_ACCESS_FS_READ_FILE |
+        LANDLOCK_ACCESS_FS_WRITE_FILE |
+        LANDLOCK_ACCESS_FS_READ_DIR |
+        LANDLOCK_ACCESS_FS_EXECUTE,
+};
+
+int ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+                                          sizeof(ruleset_attr), 0);
+if (ruleset_fd < 0) return;  /* Kernel too old, graceful fallback */
+
+/* 2. Add allowed paths */
+static void allow_path(int ruleset_fd, const char *path, uint64_t access) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_PATH);
+    if (fd < 0) return;
+
+    struct landlock_path_beneath_attr attr = {
+        .allowed_access = access,
+        .parent_fd = fd,
+    };
+    landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &attr, 0);
+    close(fd);
+}
+
+allow_path(ruleset_fd, "/etc",  LANDLOCK_ACCESS_FS_READ_FILE |
+                                LANDLOCK_ACCESS_FS_READ_DIR);
+allow_path(ruleset_fd, "/tmp",  LANDLOCK_ACCESS_FS_READ_FILE |
+                                LANDLOCK_ACCESS_FS_WRITE_FILE);
+allow_path(ruleset_fd, config_dir, LANDLOCK_ACCESS_FS_READ_FILE |
+                                   LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                   LANDLOCK_ACCESS_FS_READ_DIR);
+
+/* 3. Enforce */
+prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);  /* Required */
+landlock_restrict_self(ruleset_fd, 0);
+close(ruleset_fd);
+```
+
+### Common Gotchas
+
+**Paths must exist at sandbox time.** `open(path, O_PATH)` fails if the path
+doesn't exist. If your config directory is created at runtime, create it
+before installing landlock.
+
+**Don't forget /dev, /proc, /usr/lib.** Shared libraries are loaded from
+`/usr/lib`. Devices like `/dev/dri/card0` need `/dev`. Time functions read
+`/proc`. Missing these causes mysterious failures deep in libc.
+
+**Landlock is per-process and inherited.** Like seccomp, children inherit
+the sandbox. A spawned curl process can only access paths you whitelisted.
+
+**Graceful fallback.** `landlock_create_ruleset` returns `-ENOSYS` on kernels
+before 5.13. Always check and continue without sandboxing rather than failing.
+
+---
+
+## prctl Hardening
+
+Additional per-process security settings via `prctl(2)`.
+
+```c
+#include <sys/prctl.h>
+
+/* Required for seccomp and landlock */
+prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+/* Prevent core dumps (no data leaks) */
+prctl(PR_SET_DUMPABLE, 0);
+
+/* 1ns timer precision (default is 50us) */
+prctl(PR_SET_TIMERSLACK, 1);
+```
+
+| Call | Effect |
+|------|--------|
+| `PR_SET_NO_NEW_PRIVS` | Process (and children) can never gain privileges. Required by seccomp and landlock. |
+| `PR_SET_DUMPABLE` | Set to 0: no core dumps, `/proc/pid/mem` inaccessible. Prevents data extraction. |
+| `PR_SET_TIMERSLACK` | Minimum nanoseconds the kernel can add to timer wakeups. Default 50us. Set to 1 for precision-critical daemons. |
+
+---
+
+## Syscall Auditing Methodology
+
+The complete workflow for building a seccomp whitelist for any daemon.
+
+### Step 1: Full Strace
+
+```bash
+# Record every syscall across all code paths
+strace -f -o /tmp/full_trace.log ./daemon --daemon &
+PID=$!
+
+# Exercise code paths
+./daemon --status
+./daemon --set 3500 5
+./daemon --resume
+sleep 120  # Let at least 2 timer ticks fire
+kill $PID
+```
+
+### Step 2: Extract Unique Syscalls
+
+```bash
+awk -F'(' '{print $1}' /tmp/full_trace.log | \
+    sed 's/^[0-9]* *//' | \
+    grep -v '^[+-]' | grep -v '^\-\-\-' | grep -v '^$' | \
+    sort -u > /tmp/used_syscalls.txt
+```
+
+### Step 3: Map Names to Numbers
+
+```bash
+# ausyscall converts names to numbers and vice versa
+while read name; do
+    num=$(ausyscall "$name" 2>/dev/null || echo "???")
+    printf "%-25s %s\n" "$name" "$num"
+done < /tmp/used_syscalls.txt
+```
+
+### Step 4: Identify Init-Only vs Runtime Syscalls
+
+Review the strace log chronologically. Syscalls before your "sandbox installed"
+log message are init-only and don't need whitelisting. Syscalls after are
+runtime and must be in the filter.
+
+```bash
+# Find the seccomp installation point in the trace
+grep -n "prctl.*SECCOMP" /tmp/full_trace.log
+# Everything after that line number = runtime syscalls
+```
+
+### Step 5: Diff Against Whitelist
+
+```bash
+# Extract syscall names from your seccomp.c
+grep '__NR_' src/seccomp.c | sed 's/.*__NR_//' | sed 's/).*//' | sort \
+    > /tmp/whitelisted.txt
+
+# Compare
+diff /tmp/used_syscalls.txt /tmp/whitelisted.txt
+```
+
+Lines with `<` are syscalls your program uses but hasn't whitelisted.
+
+### Step 6: Validate
+
+```bash
+# Run with the filter and strace simultaneously
+# If strace shows the program surviving, the whitelist is complete
+strace -f ./daemon --daemon &
+sleep 10 && kill $!
+# Check for "killed by SIGSYS" in output
+```
 
 ---
 

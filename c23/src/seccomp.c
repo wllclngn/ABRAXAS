@@ -124,11 +124,7 @@ bool seccomp_install_filter(void)
         ALLOW_SYSCALL(__NR_exit),
         ALLOW_SYSCALL(__NR_exit_group),
 
-        /* --- Whitelist: select fallback --- */
-        ALLOW_SYSCALL(__NR_select),
-        ALLOW_SYSCALL(__NR_pselect6),
-        ALLOW_SYSCALL(__NR_timerfd_create),
-        ALLOW_SYSCALL(__NR_timerfd_settime),
+        /* --- Whitelist: event fds (inotify + signalfd) --- */
         ALLOW_SYSCALL(__NR_signalfd4),
         ALLOW_SYSCALL(__NR_inotify_init1),
         ALLOW_SYSCALL(__NR_inotify_add_watch),

@@ -80,7 +80,7 @@ fn ioctl_rw<T>(fd: RawFd, nr: u8, data: &mut T) -> Result<(), Error> {
     let request: libc::c_ulong =
         (3 << 30) | ((size as libc::c_ulong & 0x3FFF) << 16) | ((DRM_IOCTL_BASE as libc::c_ulong) << 8) | nr as libc::c_ulong;
 
-    let ret = unsafe { libc::ioctl(fd, request, data as *mut T) };
+    let ret = unsafe { libc::ioctl(fd, request as libc::Ioctl, data as *mut T) };
     if ret < 0 {
         Err(Error::Resources)
     } else {
