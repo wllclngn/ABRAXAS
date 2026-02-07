@@ -32,6 +32,7 @@ pub const EV_INOTIFY: u64 = 1;
 pub const EV_SIGNAL: u64 = 2;
 pub const EV_TIMEOUT: u64 = 3;
 pub const EV_CANCEL: u64 = 4;
+pub const EV_WEATHER: u64 = 5;
 
 /// Kernel struct io_sqring_offsets (40 bytes)
 #[repr(C)]

@@ -43,6 +43,7 @@ constexpr uint64_t EV_INOTIFY = 1;
 constexpr uint64_t EV_SIGNAL  = 2;
 constexpr uint64_t EV_TIMEOUT = 3;
 constexpr uint64_t EV_CANCEL  = 4;
+constexpr uint64_t EV_WEATHER = 5;
 
 /* --- Gamma control (libmeridian direct calls) --- */
 
@@ -171,12 +172,17 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
         .tv_nsec = 0
     };
 
+    weather_fetch_state_t wfs;
+    weather_async_init(&wfs);
+
     while (1) {
         /* Submit: poll both fds + timeout */
         if (inotify_fd >= 0)
             uring_prep_poll(ring, inotify_fd, EV_INOTIFY);
         if (signal_fd >= 0)
             uring_prep_poll(ring, signal_fd, EV_SIGNAL);
+        if (wfs.pipe_fd >= 0)
+            uring_prep_poll(ring, wfs.pipe_fd, EV_WEATHER);
         uring_prep_timeout(ring, &ts, EV_TIMEOUT);
 
         int ret = uring_submit_and_wait(ring);
@@ -185,6 +191,7 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
         /* Process completions */
         bool timer_expired = false;
         bool got_signal = false;
+        bool weather_ready = false;
         bool config_changed = false;
         bool override_changed = false;
 
@@ -201,6 +208,9 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
                 if (cqe->res > 0)
                     process_inotify(inotify_fd, state,
                                     &config_changed, &override_changed);
+                break;
+            case EV_WEATHER:
+                if (cqe->res > 0) weather_ready = true;
                 break;
             case EV_CANCEL:
                 break;
@@ -225,6 +235,7 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
                 (void)n;
             }
             fprintf(stderr, "\nReceived shutdown signal...\n");
+            weather_async_cleanup(&wfs);
             break;
         }
 
@@ -283,19 +294,31 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
         }
 
 #ifndef NOAA_DISABLED
-        if (config_weather_needs_refresh(&state->weather)) {
+        /* Start async weather fetch if needed and not in-flight */
+        if (wfs.phase == WEATHER_IDLE && config_weather_needs_refresh(&state->weather)) {
             struct tm nt;
             localtime_r(&now, &nt);
-            fprintf(stderr, "[%02d:%02d:%02d] Refreshing weather...\n", nt.tm_hour, nt.tm_min, nt.tm_sec);
+            fprintf(stderr, "[%02d:%02d:%02d] Starting weather fetch...\n",
+                    nt.tm_hour, nt.tm_min, nt.tm_sec);
+            (void)weather_async_start(&wfs, state->location.lat, state->location.lon);
+        }
 
-            state->weather = weather_fetch(state->location.lat, state->location.lon);
-            config_save_weather_cache(&state->paths, &state->weather);
-
-            if (!state->weather.has_error)
-                fprintf(stderr, "  Weather: %s (%d%% clouds)\n",
-                       state->weather.forecast, state->weather.cloud_cover);
-            else
-                fprintf(stderr, "  Weather fetch failed\n");
+        /* Process async weather data if pipe signaled */
+        if (weather_ready && wfs.phase != WEATHER_IDLE) {
+            weather_data_t result;
+            int rc = weather_async_read(&wfs, &result);
+            if (rc == -1) {
+                /* Done (success or error) */
+                state->weather = result;
+                config_save_weather_cache(&state->paths, &state->weather);
+                if (!state->weather.has_error)
+                    fprintf(stderr, "  Weather: %s (%d%% clouds)\n",
+                           state->weather.forecast, state->weather.cloud_cover);
+                else
+                    fprintf(stderr, "  Weather fetch failed\n");
+            }
+            /* rc==0: EAGAIN, re-poll next iteration */
+            /* rc==1: phase transition, new pipe_fd, poll next iteration */
         }
 #endif
 

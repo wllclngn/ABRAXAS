@@ -9,6 +9,7 @@ use crate::{
     sigmoid, solar, weather, CLOUD_THRESHOLD, TEMP_UPDATE_SEC, now_epoch,
     landlock, seccomp,
 };
+use crate::weather::FetchState;
 use crate::gamma;
 use crate::uring::{self, AbraxasRing, KernelTimespec};
 
@@ -190,6 +191,8 @@ fn event_loop_uring(
         tv_nsec: 0,
     };
 
+    let mut wfs = FetchState::new();
+
     loop {
         // Submit: poll both fds + timeout
         if ino_fd >= 0 {
@@ -197,6 +200,9 @@ fn event_loop_uring(
         }
         if signal_fd >= 0 {
             ring.prep_poll(signal_fd, uring::EV_SIGNAL);
+        }
+        if wfs.needs_poll() {
+            ring.prep_poll(wfs.pipe_fd, uring::EV_WEATHER);
         }
         ring.prep_timeout(&ts, uring::EV_TIMEOUT);
 
@@ -208,6 +214,7 @@ fn event_loop_uring(
         // Process completions
         let mut timer_expired = false;
         let mut got_signal = false;
+        let mut weather_ready = false;
         let mut event = EventResult::default();
 
         while let Some(cqe) = ring.peek_cqe() {
@@ -218,6 +225,9 @@ fn event_loop_uring(
                     if cqe.res > 0 {
                         parse_inotify_fd(ino_fd, &state.paths, &mut event);
                     }
+                }
+                uring::EV_WEATHER => {
+                    if cqe.res > 0 { weather_ready = true; }
                 }
                 uring::EV_CANCEL => {}
                 _ => {}
@@ -244,10 +254,63 @@ fn event_loop_uring(
                 }
             }
             eprintln!("\nReceived shutdown signal...");
+            wfs.abort();
             break;
         }
 
         tick(state, &event);
+
+        // Async weather fetch (non-blocking, io_uring integrated)
+        #[cfg(feature = "noaa")]
+        {
+            use crate::weather::{FetchPhase, ReadResult};
+
+            if wfs.phase == FetchPhase::Idle {
+                let needs = if let Some(ref w) = state.weather {
+                    config::weather_needs_refresh(w)
+                } else {
+                    true
+                };
+                if needs {
+                    let lt = local_time(now_epoch());
+                    eprintln!(
+                        "[{:02}:{:02}:{:02}] Starting weather fetch...",
+                        lt.hour, lt.min, lt.sec
+                    );
+                    wfs.start(state.location.lat, state.location.lon);
+                }
+            }
+
+            if weather_ready {
+                match wfs.read_response() {
+                    ReadResult::Pending => {}
+                    ReadResult::NewPipe => {}
+                    ReadResult::Done(result) => {
+                        match result {
+                            Ok(wd) => {
+                                let _ = config::save_weather_cache(&state.paths, &wd);
+                                eprintln!(
+                                    "  Weather: {} ({}% clouds)",
+                                    wd.forecast, wd.cloud_cover
+                                );
+                                state.weather = Some(wd);
+                            }
+                            Err(_) => {
+                                eprintln!("  Weather fetch failed");
+                                state.weather = Some(WeatherData {
+                                    cloud_cover: 0,
+                                    forecast: "Unknown".to_string(),
+                                    temperature: 0.0,
+                                    is_day: true,
+                                    fetched_at: now_epoch(),
+                                    has_error: true,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -509,22 +572,7 @@ fn tick(state: &mut DaemonState, event: &EventResult) {
         state.weather = config::load_weather_cache(&state.paths);
     }
 
-    // Refresh weather if needed (gated by timestamp, no unnecessary file I/O)
-    if let Some(ref w) = state.weather {
-        if config::weather_needs_refresh(w) {
-            let wd = weather::fetch(state.location.lat, state.location.lon);
-            if !wd.has_error {
-                let _ = config::save_weather_cache(&state.paths, &wd);
-            }
-            state.weather = Some(wd);
-        }
-    } else {
-        let wd = weather::fetch(state.location.lat, state.location.lon);
-        if !wd.has_error {
-            let _ = config::save_weather_cache(&state.paths, &wd);
-        }
-        state.weather = Some(wd);
-    }
+    // Weather refresh is now async via io_uring POLL_ADD in event_loop_uring()
 
     // Calculate target temperature
     let target_temp = if state.manual_mode {

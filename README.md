@@ -21,7 +21,7 @@ A daemon available in C23 or Rust that smoothly adjusts your screen's color temp
 ### Daemon Reliability
 - **PID File Liveness**: Daemon writes PID on start, CLI commands check liveness before reporting success
 - **Instant Startup**: Gamma applied before weather init -- screen is correct on first frame
-- **io_uring Event Loop**: Both C23 and Rust use raw io_uring syscalls. 1 `io_uring_enter` per 60s tick via `IORING_OP_POLL_ADD` + `IORING_OP_TIMEOUT`. Requires kernel >= 5.1
+- **io_uring Event Loop**: Both C23 and Rust use raw io_uring syscalls. 1 `io_uring_enter` per 60s tick via `IORING_OP_POLL_ADD` + `IORING_OP_TIMEOUT`. Weather fetches are non-blocking via `POLL_ADD` on the curl child's stdout pipe -- zero event loop stalls. Requires kernel >= 5.1
 - **inotify**: Config file hot-reload via IN_CLOSE_WRITE (no spurious partial-write triggers)
 - **signalfd**: Clean SIGTERM/SIGINT shutdown
 - **seccomp-bpf**: Both C23 and Rust. ~81 whitelisted syscalls, KILL_PROCESS on violation. Raw BPF, no libseccomp
@@ -99,7 +99,7 @@ Both implementations produce the same `abraxas` binary, same CLI interface, same
 | Syscalls/tick       | 1            | 1             | 1              |
 | Daemon threads      | 1            | 1             | 1              |
 | CPU / hour          | < 1s         | < 1s          | < 1s           |
-| Weather timeout     | 5s per req   | 5s per req    | 5s per req     |
+| Weather             | async (POLL_ADD) | async (POLL_ADD) | async (POLL_ADD) |
 
 ### Strace Syscall Audit (verified via `strace -f -c`)
 
@@ -117,7 +117,7 @@ Rust's higher invocation count comes from its runtime (futex, clone3, eventfd2, 
 
 ### Test Suite
 
-97 tests: 88 pass, 0 fail, 9 skip. The 9 skips are Rust-musl daemon/strace tests (DRM-only binary has no gamma backend on X11 desktop sessions). Full cross-compatibility verified: C23-written config and override files are correctly read by Rust and vice versa. Solar calculations agree to within 0K temperature, identical sunrise/sunset times, and matching sun elevation.
+109 tests: 100 pass, 0 fail, 9 skip. The 9 skips are Rust-musl daemon/strace tests (DRM-only binary has no gamma backend on X11 desktop sessions). Full cross-compatibility verified: C23-written config and override files are correctly read by Rust and vice versa. Solar calculations agree to within 0K temperature, identical sunrise/sunset times, and matching sun elevation.
 
 ## Architecture
 
@@ -137,7 +137,7 @@ ABRAXAS/
 abraxas (C23, single binary -- libmeridian statically linked)
     |
     +-- NOAA sun ephemeris (offline calculation)
-    +-- Weather from api.weather.gov (posix_spawnp curl, 5s timeout)
+    +-- Weather from api.weather.gov (posix_spawnp curl, async via POLL_ADD)
     +-- Sigmoid transition engine
     +-- Custom RFC 8259 JSON parser (no vendored code)
     +-- io_uring event loop (raw syscalls)
@@ -164,7 +164,7 @@ abraxas (C23, single binary -- libmeridian statically linked)
 abraxas (Rust, single binary -- all backends compiled in via cargo features)
     |
     +-- NOAA sun ephemeris (same algorithm, std::f64)
-    +-- Weather from api.weather.gov (Command::new curl, 5s timeout)
+    +-- Weather from api.weather.gov (Command::new curl, async via POLL_ADD)
     +-- Sigmoid transition engine (same curve)
     +-- Config via serde_json
     +-- io_uring event loop (raw syscalls, same as C23)
@@ -239,7 +239,7 @@ The manual call communicates with the running daemon via a control file (watched
 
 Every 15 minutes, ABRAXAS fetches the hourly forecast from `api.weather.gov` (NOAA, US only). If cloud cover exceeds 75%, daytime temperature drops from 6500K to 4500K ("dark mode"). This prevents eye strain on overcast days when the ambient light is already dim.
 
-The weather API requires no API key. Rate limits are generous (per User-Agent). Each request has a 5-second timeout (max 10s for both NOAA requests combined). Both implementations exec curl(1) for HTTP requests (C23 via posix_spawnp, Rust via Command::new). No HTTP library dependency.
+The weather API requires no API key. Rate limits are generous (per User-Agent). Both implementations exec curl(1) for HTTP requests (C23 via posix_spawnp, Rust via Command::new) with non-blocking I/O -- the curl child's stdout pipe is polled via io_uring `POLL_ADD`, so weather fetches never stall the event loop. No HTTP library dependency.
 
 ## Installation
 
@@ -315,7 +315,15 @@ abraxas --status
 
 ### Autostart
 
-**Window managers (awesome, i3, sway, etc.):** Launch from your WM config. This guarantees the display server is ready -- gamma applies instantly on login.
+**Systemd service (recommended):**
+
+```bash
+cp abraxas.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now abraxas.service
+```
+
+**Or** launch from your WM config (pick one, not both -- using both causes duplicate daemons):
 
 ```lua
 -- awesome: rc.lua
@@ -324,14 +332,6 @@ awful.spawn("/home/USER/.local/bin/abraxas --daemon")
 ```bash
 # i3/sway: config
 exec --no-startup-id ~/.local/bin/abraxas --daemon
-```
-
-**Desktop environments (GNOME, KDE):** The systemd service works if your DE activates `graphical-session.target`:
-
-```bash
-cp abraxas.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now abraxas.service
 ```
 
 ### Migrating from redshift
