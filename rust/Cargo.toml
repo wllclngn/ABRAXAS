@@ -1,6 +1,6 @@
 [package]
 name = "abraxas"
-version = "6.0.0"
+version = "6.1.0"
 edition = "2021"
 description = "Dynamic color temperature daemon with weather awareness"
 

@@ -729,6 +729,15 @@ def test_reset(R):
 _active_daemons = []
 
 
+def _kill_process_group(proc, sig=signal.SIGKILL):
+    """Kill entire process group (handles start_new_session=True children)."""
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def _daemon_cleanup_files(proc):
     """Close and remove daemon stderr temp file."""
     if hasattr(proc, '_stderr_file'):
@@ -779,7 +788,7 @@ def _start_daemon(binary, env, startup_wait=3):
     if not _daemon_reached_event_loop(output) and \
        ("gamma" in output.lower() or "drm" in output.lower() or
         "Failed" in output):
-        proc.kill()
+        _kill_process_group(proc)
         try:
             proc.wait(timeout=5)
         except Exception:
@@ -798,7 +807,7 @@ def _stop_daemon(proc, timeout=15):
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_process_group(proc)
         try:
             proc.wait(timeout=5)
         except Exception:
@@ -822,7 +831,7 @@ def _stop_daemon(proc, timeout=15):
 def _kill_daemon(proc):
     """Force kill if still alive."""
     try:
-        proc.kill()
+        _kill_process_group(proc)
         proc.wait(timeout=2)
     except Exception:
         pass
@@ -835,7 +844,7 @@ def _cleanup_all_daemons():
     """Kill any daemon processes that survived test cleanup."""
     for proc in list(_active_daemons):
         try:
-            proc.kill()
+            _kill_process_group(proc)
             proc.wait(timeout=2)
         except Exception:
             pass
@@ -1479,7 +1488,7 @@ def test_strace_audit(R):
                 output = (stdout.decode('utf-8', errors='replace') +
                           stderr.decode('utf-8', errors='replace'))
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _kill_process_group(proc)
                 try:
                     proc.communicate(timeout=5)
                 except Exception:
@@ -1532,7 +1541,7 @@ def test_strace_audit(R):
         finally:
             if proc:
                 try:
-                    proc.kill()
+                    _kill_process_group(proc)
                     proc.wait(timeout=5)
                 except Exception:
                     pass
