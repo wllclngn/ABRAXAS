@@ -63,7 +63,9 @@ bool seccomp_install_filter(void)
         ALLOW_SYSCALL(__NR_mremap),
 
         /* --- Whitelist: io_uring --- */
+        ALLOW_SYSCALL(__NR_io_uring_setup),
         ALLOW_SYSCALL(__NR_io_uring_enter),
+        ALLOW_SYSCALL(__NR_io_uring_register),
 
         /* --- Whitelist: time --- */
         ALLOW_SYSCALL(__NR_clock_gettime),
@@ -130,6 +132,20 @@ bool seccomp_install_filter(void)
         ALLOW_SYSCALL(__NR_signalfd4),
         ALLOW_SYSCALL(__NR_inotify_init1),
         ALLOW_SYSCALL(__NR_inotify_add_watch),
+
+        /* --- Whitelist: socket I/O (X11/Wayland backend, curl child) --- */
+        ALLOW_SYSCALL(__NR_socket),
+        ALLOW_SYSCALL(__NR_connect),
+        ALLOW_SYSCALL(__NR_sendto),
+        ALLOW_SYSCALL(__NR_sendmsg),
+        ALLOW_SYSCALL(__NR_recvfrom),
+        ALLOW_SYSCALL(__NR_recvmsg),
+        ALLOW_SYSCALL(__NR_getpeername),
+        ALLOW_SYSCALL(__NR_getsockname),
+        ALLOW_SYSCALL(__NR_poll),
+        ALLOW_SYSCALL(__NR_ppoll),
+        ALLOW_SYSCALL(__NR_writev),
+        ALLOW_SYSCALL(__NR_uname),
 
         /* --- Whitelist: dlopen (backend loading) --- */
         ALLOW_SYSCALL(__NR_getdents64),

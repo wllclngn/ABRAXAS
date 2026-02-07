@@ -21,9 +21,12 @@ A daemon available in C23 or Rust that smoothly adjusts your screen's color temp
 ### Daemon Reliability
 - **PID File Liveness**: Daemon writes PID on start, CLI commands check liveness before reporting success
 - **Instant Startup**: Gamma applied before weather init -- screen is correct on first frame
-- **timerfd**: 60-second update ticks (no `sleep()` drift)
+- **io_uring Event Loop** (C23): 1 syscall per 60s tick via `IORING_OP_POLL_ADD` + `IORING_OP_TIMEOUT`. Automatic fallback to select()+timerfd on older kernels
 - **inotify**: Config file hot-reload via IN_CLOSE_WRITE (no spurious partial-write triggers)
-- **signalfd**: Clean SIGTERM/SIGINT shutdown via `select()`/`poll()`
+- **signalfd**: Clean SIGTERM/SIGINT shutdown
+- **seccomp-bpf** (C23): ~75 whitelisted syscalls, KILL_PROCESS on violation. Raw BPF, no libseccomp
+- **landlock** (C23): Filesystem sandboxed to config dir, /dev, /proc, /usr, /etc, /lib, /tmp
+- **prctl hardening** (C23): 1ns timer slack, no-new-privs, non-dumpable
 - **Temperature Logging**: Every tick logs current mode, temperature, sun position, and cloud cover to stderr
 - **Zero Polling**: CPU usage ~180ms over 3 hours
 
@@ -60,8 +63,8 @@ Both implementations produce the same `abraxas` binary, same CLI interface, same
 
 |                  | C23                | Rust               |
 |------------------|--------------------|--------------------|
-| Compiler         | GCC 14 (-std=c2x)  | rustc 1.75+        |
-| Source LOC        | ~5,100             | ~3,100             |
+| Compiler         | GCC 15 (-std=c2x)  | rustc 1.75+        |
+| Source LOC        | ~5,900             | ~3,500             |
 | Memory model     | manual alloc/free  | ownership/borrow   |
 | Gamma: DRM       | raw ioctl          | raw ioctl          |
 | Gamma: Wayland   | .so plugin (dlopen)| wayland-client     |
@@ -69,10 +72,10 @@ Both implementations produce the same `abraxas` binary, same CLI interface, same
 | Gamma: GNOME     | dlopen at runtime  | libsystemd/sd-bus  |
 | Weather          | posix_spawnp curl(1)| ureq (5s timeout) |
 | Config parse     | hand-rolled JSON   | serde_json         |
-| CLI args         | getopt_long        | hand-rolled        |
-| Timer/signals    | timerfd + signalfd | timerfd + signalfd |
-| Event loop       | select() on 3 fds  | poll() on 3 fds    |
-| Steady-state     | 2 syscalls/tick    | 2 syscalls/tick    |
+| Event loop       | io_uring (1 syscall/tick) | poll() on 3 fds (2 syscalls/tick) |
+| Sandbox          | seccomp + landlock | none               |
+| LTO              | -flto=auto + gc-sections | cargo (default) |
+| Static build     | make static (musl) | N/A                |
 | Heap allocs/tick | 0                  | 0                  |
 | Default backends | auto (pkg-config)  | noaa + x11 (cargo) |
 
@@ -80,14 +83,16 @@ Both implementations produce the same `abraxas` binary, same CLI interface, same
 
 |                     | C23          | Rust          | Notes                          |
 |---------------------|--------------|---------------|--------------------------------|
-| Binary size         | 71 KB        | 2,590 KB      | C23 wins: 36.5x smaller        |
+| Binary size         | 69 KB        | 2,590 KB      | C23 wins: 37.5x smaller        |
+| Binary (static musl)| 121 KB       | N/A           | Zero shared libs, DRM-only     |
 | Shared libs (ldd)   | 3            | 5             | C23: libc, libm, ld-linux      |
-| Startup (--help)    | **0.7 ms**   | 1.4 ms        | **C23 wins: 2.0x faster**      |
-| --status            | **0.7 ms**   | 1.0 ms        | **C23 wins: 1.4x faster**      |
+| Startup (--help)    | **0.6 ms**   | 0.9 ms        | **C23 wins: 1.5x faster**      |
+| --status            | **0.7 ms**   | 1.1 ms        | **C23 wins: 1.6x faster**      |
 | --set               | **0.7 ms**   | 1.0 ms        | **C23 wins: 1.4x faster**      |
-| Daemon RSS          | ~14 MB       | ~14 MB        | Tie                            |
+| Daemon memory       | **648 KB**   | ~14 MB        | **C23 wins: 22x less memory**  |
+| Daemon peak memory  | 2.6 MB       | ~14 MB        | Peak during startup (dlopen)   |
+| Syscalls/tick       | **1**        | 2             | io_uring vs poll+read          |
 | Daemon threads      | 1            | 1             | Tie                            |
-| Daemon FDs          | 7            | 7             | Tie                            |
 | CPU / hour          | < 1s         | < 1s          | Tie                            |
 | Weather timeout     | 5s per req   | 5s per req    | Tie                            |
 
