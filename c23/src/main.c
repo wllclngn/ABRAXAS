@@ -37,7 +37,7 @@
 
 static void cmd_status(double lat, double lon, const abraxas_paths_t *paths)
 {
-    printf("ABRAXAS v8.2.0 [C23]\n\n");
+    printf("ABRAXAS v8.4.0 [C23]\n\n");
     printf("Location: %.4f, %.4f\n\n", lat, lon);
 
     time_t now = time(nullptr);
@@ -265,7 +265,7 @@ static void bench_print(const char *label, uint64_t ns, int iterations)
 
 static int cmd_benchmark(const abraxas_paths_t *paths)
 {
-    printf("ABRAXAS v8.2.0 [C23] -- Kernel-grade benchmark\n");
+    printf("ABRAXAS v8.4.0 [C23] -- Kernel-grade benchmark\n");
     printf("Clock: CLOCK_MONOTONIC_RAW (hardware TSC)\n\n");
 
     constexpr int N = 1000;
