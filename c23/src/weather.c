@@ -10,81 +10,101 @@
  * Cloud cover is derived from forecast keyword heuristic (no direct cloud %
  * in the hourly forecast -- NOAA provides probabilityOfPrecipitation instead).
  *
- * This file owns the entire NOAA/libcurl lifecycle. No other file includes
- * <curl/curl.h> or calls curl directly. When NOAA_DISABLED is defined
- * (non-US builds), all three public functions compile to no-ops/stubs
- * and libcurl is not linked.
+ * HTTP is handled by exec'ing the curl(1) binary via posix_spawnp.
+ * No libcurl linkage -- zero shared library overhead for CLI commands.
+ * When NOAA_DISABLED is defined (non-US builds), all three public functions
+ * compile to no-ops/stubs.
  */
 
+#define _GNU_SOURCE
 #include "weather.h"
 #include "json.h"
 
 #ifndef NOAA_DISABLED
 
-#include <curl/curl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
 
-/* Dynamic response buffer for libcurl */
+extern char **environ;
+
+/* Dynamic response buffer */
 typedef struct {
     char   *data;
     size_t  size;
     size_t  cap;
 } response_buf_t;
 
-static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
+static bool buf_grow(response_buf_t *buf, size_t needed)
 {
-    response_buf_t *buf = userdata;
-    size_t total = size * nmemb;
-
-    if (buf->size + total + 1 > buf->cap) {
-        size_t new_cap = (buf->cap ? buf->cap * 2 : 4096);
-        while (new_cap < buf->size + total + 1) new_cap *= 2;
-        char *new_data = realloc(buf->data, new_cap);
-        if (!new_data) return 0;
-        buf->data = new_data;
-        buf->cap = new_cap;
-    }
-
-    memcpy(buf->data + buf->size, ptr, total);
-    buf->size += total;
-    buf->data[buf->size] = '\0';
-    return total;
+    if (buf->size + needed + 1 <= buf->cap) return true;
+    size_t new_cap = (buf->cap ? buf->cap * 2 : 4096);
+    while (new_cap < buf->size + needed + 1) new_cap *= 2;
+    char *new_data = realloc(buf->data, new_cap);
+    if (!new_data) return false;
+    buf->data = new_data;
+    buf->cap = new_cap;
+    return true;
 }
 
+/*
+ * HTTP GET via curl(1) binary.
+ * Spawns: curl -s -f -L --max-time 5 -H ... -H ... <url>
+ * Reads stdout through a pipe. Returns false on spawn/HTTP failure.
+ */
 static bool http_get(const char *url, response_buf_t *resp)
 {
     resp->data = nullptr;
     resp->size = 0;
     resp->cap = 0;
 
-    CURL *curl = curl_easy_init();
-    if (!curl) return false;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return false;
 
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "User-Agent: abraxas/4.0 (weather color temp daemon)");
-    headers = curl_slist_append(headers, "Accept: application/geo+json");
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
 
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
-    constexpr long CURL_TIMEOUT_SEC = 5L;
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, CURL_TIMEOUT_SEC);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    char *argv[] = {
+        "curl", "-s", "-f", "-L", "--max-time", "5",
+        "-H", "User-Agent: abraxas/4.1 (weather color temp daemon)",
+        "-H", "Accept: application/geo+json",
+        (char *)url, nullptr
+    };
 
-    CURLcode res = curl_easy_perform(curl);
+    pid_t pid;
+    int err = posix_spawnp(&pid, "curl", &actions, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]); /* parent doesn't write */
 
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (err != 0) {
+        close(pipefd[0]);
+        return false;
+    }
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    /* Read child stdout into buffer */
+    char chunk[4096];
+    for (;;) {
+        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+        if (n <= 0) break;
+        if (!buf_grow(resp, (size_t)n)) break;
+        memcpy(resp->data + resp->size, chunk, (size_t)n);
+        resp->size += (size_t)n;
+    }
+    close(pipefd[0]);
 
-    if (res != CURLE_OK || http_code != 200) {
+    if (resp->data) resp->data[resp->size] = '\0';
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !resp->data || resp->size == 0) {
         free(resp->data);
         resp->data = nullptr;
         resp->size = 0;
@@ -142,15 +162,8 @@ static int cloud_cover_from_forecast(const char *forecast)
     return 0;
 }
 
-void weather_init(void)
-{
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-}
-
-void weather_cleanup(void)
-{
-    curl_global_cleanup();
-}
+void weather_init(void)  {}
+void weather_cleanup(void) {}
 
 weather_data_t weather_fetch(double lat, double lon)
 {

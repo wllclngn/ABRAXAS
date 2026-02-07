@@ -193,7 +193,7 @@ fn main() {
 }
 
 fn cmd_status(lat: f64, lon: f64, paths: &config::Paths) {
-    println!("ABRAXAS v4.0.0 [Rust]\n");
+    println!("ABRAXAS v5.0.0 [Rust]\n");
     println!("Location: {:.4}, {:.4}\n", lat, lon);
 
     let now = chrono_now();

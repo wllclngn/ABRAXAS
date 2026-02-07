@@ -378,6 +378,18 @@ def cmd_install(args, source_dir: Path) -> bool:
         log_error(f"Failed to install binary: {e}")
         return False
 
+    # Copy Wayland plugin alongside binary (C23 only, rpath=$ORIGIN)
+    if impl_choice == "c23":
+        wl_plugin = source_dir / "c23" / "meridian_wl.so"
+        if wl_plugin.exists():
+            dest_plugin = INSTALL_BINARY.parent / "meridian_wl.so"
+            log_info("Installing Wayland plugin (meridian_wl.so)...")
+            try:
+                shutil.copy2(wl_plugin, dest_plugin)
+                dest_plugin.chmod(0o755)
+            except OSError as e:
+                log_warn(f"Failed to install Wayland plugin: {e}")
+
     # Copy ZIP database (skip for non-USA builds)
     if not non_usa:
         if source_zipdb.exists():
@@ -409,6 +421,9 @@ def cmd_install(args, source_dir: Path) -> bool:
             uid, gid = pw.pw_uid, pw.pw_gid
 
             os.chown(INSTALL_BINARY, uid, gid)
+            wl_dest = INSTALL_BINARY.parent / "meridian_wl.so"
+            if wl_dest.exists():
+                os.chown(wl_dest, uid, gid)
             if INSTALL_SERVICE.exists():
                 os.chown(INSTALL_SERVICE, uid, gid)
 
@@ -445,6 +460,7 @@ def cmd_uninstall(args, source_dir: Path) -> bool:
 
     files = [
         INSTALL_BINARY,
+        INSTALL_BINARY.parent / "meridian_wl.so",
         INSTALL_SERVICE,
     ]
 
@@ -544,18 +560,20 @@ def cmd_test(args, source_dir: Path) -> bool:
     print("  ┌──────────────────┬───────────────────┬───────────────────┐")
     print("  │                  │ C23               │ Rust              │")
     print("  ├──────────────────┼───────────────────┼───────────────────┤")
-    print("  │ Compiler         │ GCC 14 (-std=c2x) │ rustc 1.75+       │")
-    print("  │ Binary size      │ ~75 KB            │ ~2.6 MB           │")
-    print("  │ Source LOC       │ ~5,100            │ ~2,900            │")
+    print("  │ Compiler         │ GCC 15 (-std=c2x) │ rustc 1.75+       │")
+    print("  │ Binary size      │ ~69 KB            │ ~2.6 MB           │")
+    print("  │ Shared libs      │ 3                 │ 5                 │")
     print("  │ Memory model     │ manual alloc/free │ ownership/borrow  │")
     print("  │ Gamma: DRM       │ raw ioctl         │ raw ioctl         │")
-    print("  │ Gamma: Wayland   │ libwayland-client │ wayland-client    │")
-    print("  │ Gamma: X11       │ libX11+libXrandr  │ x11rb             │")
-    print("  │ Gamma: GNOME     │ libsystemd/sd-bus │ libsystemd/sd-bus │")
-    print("  │ Weather          │ libcurl           │ ureq              │")
+    print("  │ Gamma: Wayland   │ dlopen plugin     │ wayland-client    │")
+    print("  │ Gamma: X11       │ dlopen            │ x11rb             │")
+    print("  │ Gamma: GNOME     │ dlopen sd-bus     │ libsystemd/sd-bus │")
+    print("  │ Weather          │ curl(1) via spawn │ ureq              │")
     print("  │ Config parse     │ hand-rolled JSON  │ serde_json        │")
-    print("  │ CLI args         │ getopt_long       │ hand-rolled       │")
-    print("  │ Timer/signals    │ timerfd+signalfd  │ timerfd+signalfd  │")
+    print("  │ Event loop       │ io_uring + select │ timerfd+signalfd  │")
+    print("  │ Sandbox          │ seccomp + landlock │ none              │")
+    print("  │ LTO              │ yes (-flto=auto)  │ yes (cargo)       │")
+    print("  │ Static build     │ make static (musl)│ N/A               │")
     print("  └──────────────────┴───────────────────┴───────────────────┘")
 
     # Show actual binary sizes if built
@@ -645,11 +663,22 @@ def cmd_update(args, source_dir: Path) -> bool:
     shutil.copy2(source_binary, INSTALL_BINARY)
     INSTALL_BINARY.chmod(0o755)
 
+    # Copy Wayland plugin (C23 only)
+    if impl_choice == "c23":
+        wl_plugin = source_dir / "c23" / "meridian_wl.so"
+        if wl_plugin.exists():
+            dest_plugin = INSTALL_BINARY.parent / "meridian_wl.so"
+            shutil.copy2(wl_plugin, dest_plugin)
+            dest_plugin.chmod(0o755)
+
     # Fix ownership if running as root
     if os.environ.get("SUDO_USER"):
         try:
             pw = pwd.getpwnam(_real_user)
             os.chown(INSTALL_BINARY, pw.pw_uid, pw.pw_gid)
+            wl_dest = INSTALL_BINARY.parent / "meridian_wl.so"
+            if wl_dest.exists():
+                os.chown(wl_dest, pw.pw_uid, pw.pw_gid)
         except (KeyError, OSError) as e:
             log_warn(f"Failed to fix ownership: {e}")
 
@@ -682,7 +711,7 @@ Examples:
   ./install.py --impl c23         # Install C23 implementation
   ./install.py --impl rust        # Install Rust implementation
   ./install.py --no-service       # Install without prompting for service
-  ./install.py --non-usa          # Install without NOAA weather (no libcurl)
+  ./install.py --non-usa          # Install without NOAA weather support
   ./install.py test               # Show implementation comparison
   ./install.py status             # Check installation status
   ./install.py enable             # Enable service
@@ -698,7 +727,7 @@ Examples:
     parser.add_argument("--rebuild", action="store_true",
                        help="Force rebuild even if already built")
     parser.add_argument("--non-usa", action="store_true",
-                       help="Disable NOAA weather (no libcurl dependency)")
+                       help="Disable NOAA weather support")
     parser.add_argument("--impl", dest="impl_choice", choices=["c23", "rust"],
                        default=None,
                        help="Choose implementation (default: prompt)")

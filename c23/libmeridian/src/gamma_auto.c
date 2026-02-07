@@ -7,13 +7,18 @@
  *      b. GNOME (Mutter DBus) - GNOME Wayland
  *   2. DRM (kernel ioctl) - always available
  *   3. X11 (RandR) - NVIDIA fallback
+ *
+ * X11 and GNOME backends load their libraries via dlopen (in their own files).
+ * Wayland backend is a separate .so plugin (meridian_wl.so) loaded here.
  */
 
+#define _GNU_SOURCE
 #include "meridian.h"
 
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <dlfcn.h>
 
 /* ============================================================
  * Error handling (shared by all backends)
@@ -42,6 +47,57 @@ meridian_strerror(meridian_error_t err)
     }
     return "Unknown error";
 }
+
+/* ============================================================
+ * Wayland plugin (loaded via dlopen -- contains libwayland-client)
+ * ============================================================ */
+
+#ifdef MERIDIAN_HAS_WAYLAND
+static struct {
+    void *lib;
+    meridian_error_t (*init)(meridian_wl_state_t **);
+    void (*free)(meridian_wl_state_t *);
+    int (*get_crtc_count)(const meridian_wl_state_t *);
+    int (*get_gamma_size)(const meridian_wl_state_t *, int);
+    meridian_error_t (*set_temperature)(meridian_wl_state_t *, int, float);
+    meridian_error_t (*set_temperature_crtc)(meridian_wl_state_t *, int, int, float);
+    meridian_error_t (*restore)(meridian_wl_state_t *);
+    bool loaded;
+} wl_plugin;
+
+static bool wl_plugin_load(void)
+{
+    if (wl_plugin.loaded) return true;
+
+    wl_plugin.lib = dlopen("meridian_wl.so", RTLD_LAZY | RTLD_LOCAL);
+    if (!wl_plugin.lib) return false;
+
+    /* POSIX guarantees dlsym void*->fptr works; suppress ISO C pedantic */
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    #define LOAD_WL(field, sym) \
+        wl_plugin.field = dlsym(wl_plugin.lib, sym); \
+        if (!wl_plugin.field) goto fail
+
+    LOAD_WL(init,               "meridian_wl_init");
+    LOAD_WL(free,               "meridian_wl_free");
+    LOAD_WL(get_crtc_count,     "meridian_wl_get_crtc_count");
+    LOAD_WL(get_gamma_size,     "meridian_wl_get_gamma_size");
+    LOAD_WL(set_temperature,    "meridian_wl_set_temperature");
+    LOAD_WL(set_temperature_crtc, "meridian_wl_set_temperature_crtc");
+    LOAD_WL(restore,            "meridian_wl_restore");
+    #undef LOAD_WL
+    #pragma GCC diagnostic pop
+
+    wl_plugin.loaded = true;
+    return true;
+
+fail:
+    dlclose(wl_plugin.lib);
+    wl_plugin.lib = nullptr;
+    return false;
+}
+#endif
 
 /* Backend type */
 typedef enum {
@@ -82,18 +138,21 @@ meridian_init_card(int card_num, meridian_state_t **state_out)
     if (!state) return MERIDIAN_ERR_RESOURCES;
 
     meridian_error_t err;
-    const char *wayland_display = getenv("WAYLAND_DISPLAY");
 
+#ifndef ABXS_STATIC
     /* Wayland session: try Wayland backends first */
+    const char *wayland_display = getenv("WAYLAND_DISPLAY");
     if (wayland_display && wayland_display[0]) {
 
 #ifdef MERIDIAN_HAS_WAYLAND
         /* Try wlr-gamma-control (Sway, Hyprland, river, etc.) */
-        err = meridian_wl_init(&state->wl);
-        if (err == MERIDIAN_OK) {
-            state->backend = BACKEND_WAYLAND;
-            *state_out = state;
-            return MERIDIAN_OK;
+        if (wl_plugin_load()) {
+            err = wl_plugin.init(&state->wl);
+            if (err == MERIDIAN_OK) {
+                state->backend = BACKEND_WAYLAND;
+                *state_out = state;
+                return MERIDIAN_OK;
+            }
         }
 #endif
 
@@ -107,6 +166,7 @@ meridian_init_card(int card_num, meridian_state_t **state_out)
         }
 #endif
     }
+#endif /* !ABXS_STATIC */
 
     /* Try DRM */
     err = meridian_drm_init(card_num, &state->drm);
@@ -131,7 +191,7 @@ meridian_init_card(int card_num, meridian_state_t **state_out)
         state->drm = nullptr;
     }
 
-#ifdef MERIDIAN_HAS_X11
+#if !defined(ABXS_STATIC) && defined(MERIDIAN_HAS_X11)
     /* Fall back to X11 */
     err = meridian_x11_init(&state->x11);
     if (err == MERIDIAN_OK) {
@@ -162,7 +222,7 @@ meridian_free(meridian_state_t *state)
 #endif
 #ifdef MERIDIAN_HAS_WAYLAND
     case BACKEND_WAYLAND:
-        meridian_wl_free(state->wl);
+        wl_plugin.free(state->wl);
         break;
 #endif
 #ifdef MERIDIAN_HAS_GNOME
@@ -205,7 +265,7 @@ meridian_get_crtc_count(const meridian_state_t *state)
 #endif
 #ifdef MERIDIAN_HAS_WAYLAND
     case BACKEND_WAYLAND:
-        return meridian_wl_get_crtc_count(state->wl);
+        return wl_plugin.get_crtc_count(state->wl);
 #endif
 #ifdef MERIDIAN_HAS_GNOME
     case BACKEND_GNOME:
@@ -230,7 +290,7 @@ meridian_get_gamma_size(const meridian_state_t *state, int crtc_idx)
 #endif
 #ifdef MERIDIAN_HAS_WAYLAND
     case BACKEND_WAYLAND:
-        return meridian_wl_get_gamma_size(state->wl, crtc_idx);
+        return wl_plugin.get_gamma_size(state->wl, crtc_idx);
 #endif
 #ifdef MERIDIAN_HAS_GNOME
     case BACKEND_GNOME:
@@ -255,7 +315,7 @@ meridian_set_temperature(meridian_state_t *state, int temp, float brightness)
 #endif
 #ifdef MERIDIAN_HAS_WAYLAND
     case BACKEND_WAYLAND:
-        return meridian_wl_set_temperature(state->wl, temp, brightness);
+        return wl_plugin.set_temperature(state->wl, temp, brightness);
 #endif
 #ifdef MERIDIAN_HAS_GNOME
     case BACKEND_GNOME:
@@ -281,7 +341,7 @@ meridian_set_temperature_crtc(meridian_state_t *state, int crtc_idx,
 #endif
 #ifdef MERIDIAN_HAS_WAYLAND
     case BACKEND_WAYLAND:
-        return meridian_wl_set_temperature_crtc(state->wl, crtc_idx, temp, brightness);
+        return wl_plugin.set_temperature_crtc(state->wl, crtc_idx, temp, brightness);
 #endif
 #ifdef MERIDIAN_HAS_GNOME
     case BACKEND_GNOME:
@@ -306,7 +366,7 @@ meridian_restore(meridian_state_t *state)
 #endif
 #ifdef MERIDIAN_HAS_WAYLAND
     case BACKEND_WAYLAND:
-        return meridian_wl_restore(state->wl);
+        return wl_plugin.restore(state->wl);
 #endif
 #ifdef MERIDIAN_HAS_GNOME
     case BACKEND_GNOME:

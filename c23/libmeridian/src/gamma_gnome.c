@@ -5,7 +5,7 @@
  * ramps on GNOME Wayland sessions (Mutter compositor).
  *
  * Covers: GNOME on Debian, Ubuntu, Fedora, RHEL, etc.
- * Requires libsystemd (-lsystemd) for sd-bus.
+ * libsystemd loaded at runtime via dlopen -- no link-time dependency.
  */
 
 #ifdef MERIDIAN_HAS_GNOME
@@ -15,8 +15,72 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 
 #include <systemd/sd-bus.h>
+
+/* Runtime-loaded sd-bus functions */
+static struct {
+    void *lib;
+    int (*sd_bus_open_user)(sd_bus **);
+    sd_bus *(*sd_bus_unref)(sd_bus *);
+    int (*sd_bus_call_method)(sd_bus *, const char *, const char *,
+                              const char *, const char *,
+                              sd_bus_error *, sd_bus_message **, const char *, ...);
+    int (*sd_bus_call)(sd_bus *, sd_bus_message *, uint64_t,
+                       sd_bus_error *, sd_bus_message **);
+    int (*sd_bus_message_read)(sd_bus_message *, const char *, ...);
+    int (*sd_bus_message_enter_container)(sd_bus_message *, char, const char *);
+    int (*sd_bus_message_exit_container)(sd_bus_message *);
+    int (*sd_bus_message_skip)(sd_bus_message *, const char *);
+    sd_bus_message *(*sd_bus_message_unref)(sd_bus_message *);
+    int (*sd_bus_message_new_method_call)(sd_bus *, sd_bus_message **,
+                                          const char *, const char *,
+                                          const char *, const char *);
+    int (*sd_bus_message_append)(sd_bus_message *, const char *, ...);
+    int (*sd_bus_message_append_array)(sd_bus_message *, char, const void *, size_t);
+    void (*sd_bus_error_free)(sd_bus_error *);
+    bool loaded;
+} sdbus;
+
+static bool sdbus_load(void)
+{
+    if (sdbus.loaded) return true;
+
+    sdbus.lib = dlopen("libsystemd.so.0", RTLD_LAZY | RTLD_LOCAL);
+    if (!sdbus.lib) return false;
+
+    /* POSIX guarantees dlsym void*->fptr works; suppress ISO C pedantic */
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    #define LOAD(name) \
+        sdbus.name = dlsym(sdbus.lib, #name); \
+        if (!sdbus.name) goto fail
+
+    LOAD(sd_bus_open_user);
+    LOAD(sd_bus_unref);
+    LOAD(sd_bus_call_method);
+    LOAD(sd_bus_call);
+    LOAD(sd_bus_message_read);
+    LOAD(sd_bus_message_enter_container);
+    LOAD(sd_bus_message_exit_container);
+    LOAD(sd_bus_message_skip);
+    LOAD(sd_bus_message_unref);
+    LOAD(sd_bus_message_new_method_call);
+    LOAD(sd_bus_message_append);
+    LOAD(sd_bus_message_append_array);
+    LOAD(sd_bus_error_free);
+    #undef LOAD
+    #pragma GCC diagnostic pop
+
+    sdbus.loaded = true;
+    return true;
+
+fail:
+    dlclose(sdbus.lib);
+    sdbus.lib = nullptr;
+    return false;
+}
 
 #define MUTTER_DBUS_NAME  "org.gnome.Mutter.DisplayConfig"
 #define MUTTER_DBUS_PATH  "/org/gnome/Mutter/DisplayConfig"
@@ -62,23 +126,23 @@ gnome_get_resources(struct meridian_gnome_state *state)
     sd_bus_message *reply = nullptr;
     int r;
 
-    r = sd_bus_call_method(state->bus,
+    r = sdbus.sd_bus_call_method(state->bus,
                            MUTTER_DBUS_NAME,
                            MUTTER_DBUS_PATH,
                            MUTTER_DBUS_IFACE,
                            "GetResources",
                            &error, &reply, "");
     if (r < 0) {
-        sd_bus_error_free(&error);
+        sdbus.sd_bus_error_free(&error);
         return MERIDIAN_ERR_GNOME_DBUS;
     }
 
     /* Read serial */
-    r = sd_bus_message_read(reply, "u", &state->serial);
+    r = sdbus.sd_bus_message_read(reply, "u", &state->serial);
     if (r < 0) goto fail;
 
     /* Enter CRTC array: a(uxiiiiiuaua{sv}) */
-    r = sd_bus_message_enter_container(reply, 'a', "(uxiiiiiuaua{sv})");
+    r = sdbus.sd_bus_message_enter_container(reply, 'a', "(uxiiiiiuaua{sv})");
     if (r < 0) goto fail;
 
     /* Count and collect CRTC IDs */
@@ -87,16 +151,16 @@ gnome_get_resources(struct meridian_gnome_state *state)
     if (!state->crtcs) goto fail;
     state->crtc_count = 0;
 
-    while ((r = sd_bus_message_enter_container(reply, 'r', "uxiiiiiuaua{sv}")) > 0) {
+    while ((r = sdbus.sd_bus_message_enter_container(reply, 'r', "uxiiiiiuaua{sv}")) > 0) {
         uint32_t crtc_id;
-        r = sd_bus_message_read(reply, "u", &crtc_id);
+        r = sdbus.sd_bus_message_read(reply, "u", &crtc_id);
         if (r < 0) goto fail;
 
         /* Skip remaining fields in this CRTC struct */
-        r = sd_bus_message_skip(reply, "xiiiiiuaua{sv}");
+        r = sdbus.sd_bus_message_skip(reply, "xiiiiiuaua{sv}");
         if (r < 0) goto fail;
 
-        r = sd_bus_message_exit_container(reply);
+        r = sdbus.sd_bus_message_exit_container(reply);
         if (r < 0) goto fail;
 
         if (state->crtc_count >= capacity) {
@@ -111,16 +175,16 @@ gnome_get_resources(struct meridian_gnome_state *state)
     }
 
     /* Exit CRTC array */
-    sd_bus_message_exit_container(reply);
+    sdbus.sd_bus_message_exit_container(reply);
 
-    sd_bus_message_unref(reply);
-    sd_bus_error_free(&error);
+    sdbus.sd_bus_message_unref(reply);
+    sdbus.sd_bus_error_free(&error);
 
     return (state->crtc_count > 0) ? MERIDIAN_OK : MERIDIAN_ERR_NO_CRTC;
 
 fail:
-    sd_bus_message_unref(reply);
-    sd_bus_error_free(&error);
+    sdbus.sd_bus_message_unref(reply);
+    sdbus.sd_bus_error_free(&error);
     free(state->crtcs);
     state->crtcs = nullptr;
     state->crtc_count = 0;
@@ -134,10 +198,12 @@ fail:
 meridian_error_t
 meridian_gnome_init(meridian_gnome_state_t **state_out)
 {
+    if (!sdbus_load()) return MERIDIAN_ERR_GNOME_DBUS;
+
     struct meridian_gnome_state *state = calloc(1, sizeof(*state));
     if (!state) return MERIDIAN_ERR_RESOURCES;
 
-    int r = sd_bus_open_user(&state->bus);
+    int r = sdbus.sd_bus_open_user(&state->bus);
     if (r < 0) {
         free(state);
         return MERIDIAN_ERR_GNOME_DBUS;
@@ -145,7 +211,7 @@ meridian_gnome_init(meridian_gnome_state_t **state_out)
 
     meridian_error_t err = gnome_get_resources(state);
     if (err != MERIDIAN_OK) {
-        sd_bus_unref(state->bus);
+        sdbus.sd_bus_unref(state->bus);
         free(state);
         return err;
     }
@@ -163,7 +229,7 @@ meridian_gnome_free(meridian_gnome_state_t *state)
     (void)meridian_gnome_restore(state);
 
     free(state->crtcs);
-    if (state->bus) sd_bus_unref(state->bus);
+    if (state->bus) sdbus.sd_bus_unref(state->bus);
     free(state);
 }
 
@@ -200,7 +266,7 @@ gnome_set_gamma_crtc(struct meridian_gnome_state *state, int crtc_idx,
     sd_bus_message *msg = nullptr;
     int ret;
 
-    ret = sd_bus_message_new_method_call(state->bus, &msg,
+    ret = sdbus.sd_bus_message_new_method_call(state->bus, &msg,
                                           MUTTER_DBUS_NAME,
                                           MUTTER_DBUS_PATH,
                                           MUTTER_DBUS_IFACE,
@@ -208,29 +274,29 @@ gnome_set_gamma_crtc(struct meridian_gnome_state *state, int crtc_idx,
     if (ret < 0) return MERIDIAN_ERR_GNOME_DBUS;
 
     /* Append serial and CRTC ID */
-    ret = sd_bus_message_append(msg, "uu", state->serial,
+    ret = sdbus.sd_bus_message_append(msg, "uu", state->serial,
                                 state->crtcs[crtc_idx].crtc_id);
     if (ret < 0) goto fail;
 
     /* Append three gamma ramp arrays (aq = array of uint16) */
-    ret = sd_bus_message_append_array(msg, 'q', r, GNOME_GAMMA_SIZE * sizeof(uint16_t));
+    ret = sdbus.sd_bus_message_append_array(msg, 'q', r, GNOME_GAMMA_SIZE * sizeof(uint16_t));
     if (ret < 0) goto fail;
 
-    ret = sd_bus_message_append_array(msg, 'q', g, GNOME_GAMMA_SIZE * sizeof(uint16_t));
+    ret = sdbus.sd_bus_message_append_array(msg, 'q', g, GNOME_GAMMA_SIZE * sizeof(uint16_t));
     if (ret < 0) goto fail;
 
-    ret = sd_bus_message_append_array(msg, 'q', b, GNOME_GAMMA_SIZE * sizeof(uint16_t));
+    ret = sdbus.sd_bus_message_append_array(msg, 'q', b, GNOME_GAMMA_SIZE * sizeof(uint16_t));
     if (ret < 0) goto fail;
 
-    ret = sd_bus_call(state->bus, msg, 0, &error, nullptr);
-    sd_bus_message_unref(msg);
-    sd_bus_error_free(&error);
+    ret = sdbus.sd_bus_call(state->bus, msg, 0, &error, nullptr);
+    sdbus.sd_bus_message_unref(msg);
+    sdbus.sd_bus_error_free(&error);
 
     return (ret < 0) ? MERIDIAN_ERR_GNOME_DBUS : MERIDIAN_OK;
 
 fail:
-    sd_bus_message_unref(msg);
-    sd_bus_error_free(&error);
+    sdbus.sd_bus_message_unref(msg);
+    sdbus.sd_bus_error_free(&error);
     return MERIDIAN_ERR_GNOME_DBUS;
 }
 

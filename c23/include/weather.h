@@ -1,9 +1,9 @@
 /*
  * weather.h - NOAA weather API client
  *
- * This module owns the entire NOAA/libcurl lifecycle. When NOAA_DISABLED
+ * HTTP via exec'ing curl(1) -- no libcurl linkage. When NOAA_DISABLED
  * is defined (non-US builds), init/cleanup are no-ops and fetch returns
- * has_error=true. No other module touches libcurl.
+ * has_error=true.
  */
 
 #ifndef WEATHER_H
@@ -11,10 +11,10 @@
 
 #include "abraxas.h"
 
-/* Initialize weather subsystem (curl). No-op when NOAA_DISABLED. */
+/* No-op (kept for API compatibility). */
 void weather_init(void);
 
-/* Shut down weather subsystem (curl). No-op when NOAA_DISABLED. */
+/* No-op (kept for API compatibility). */
 void weather_cleanup(void);
 
 /* Fetch current weather from NOAA api.weather.gov.

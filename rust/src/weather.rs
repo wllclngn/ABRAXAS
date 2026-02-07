@@ -40,7 +40,7 @@ fn get_agent() -> &'static ureq::Agent {
         ureq::AgentBuilder::new()
             .timeout_read(std::time::Duration::from_secs(5))
             .timeout_write(std::time::Duration::from_secs(5))
-            .user_agent("abraxas/4.0 (weather color temp daemon)")
+            .user_agent("abraxas/4.1 (weather color temp daemon)")
             .build()
     })
 }

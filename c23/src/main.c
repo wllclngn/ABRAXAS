@@ -12,11 +12,14 @@
  *   --help           Show usage
  */
 
+#define _GNU_SOURCE
+
 #include "abraxas.h"
 #include "config.h"
 #include "daemon.h"
 #include "sigmoid.h"
 #include "solar.h"
+#include "uring.h"
 #include "weather.h"
 #include "zipdb.h"
 
@@ -34,7 +37,7 @@
 
 static void cmd_status(double lat, double lon, const abraxas_paths_t *paths)
 {
-    printf("ABRAXAS v4.0.0 [C23]\n\n");
+    printf("ABRAXAS v5.0.0 [C23]\n\n");
     printf("Location: %.4f, %.4f\n\n", lat, lon);
 
     time_t now = time(nullptr);
@@ -228,6 +231,153 @@ static int cmd_reset(const abraxas_paths_t *paths)
     return 0;
 }
 
+/* --- Benchmark --- */
+
+static inline uint64_t bench_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void bench_print(const char *label, uint64_t ns, int iterations)
+{
+    if (iterations > 1) {
+        uint64_t per = ns / (uint64_t)iterations;
+        if (ns >= 1000000)
+            printf("  %-30s %8lu us  (%lu ns/call, %d calls)\n",
+                   label, ns / 1000, per, iterations);
+        else if (ns >= 1000)
+            printf("  %-30s %8lu us  (%lu ns/call, %d calls)\n",
+                   label, ns / 1000, per, iterations);
+        else
+            printf("  %-30s %8lu ns  (%lu ns/call, %d calls)\n",
+                   label, ns, per, iterations);
+    } else {
+        if (ns >= 1000000)
+            printf("  %-30s %8lu us\n", label, ns / 1000);
+        else if (ns >= 1000)
+            printf("  %-30s %8lu us\n", label, ns / 1000);
+        else
+            printf("  %-30s %8lu ns\n", label, ns);
+    }
+}
+
+static int cmd_benchmark(const abraxas_paths_t *paths)
+{
+    printf("ABRAXAS v5.0.0 [C23] -- Kernel-grade benchmark\n");
+    printf("Clock: CLOCK_MONOTONIC_RAW (hardware TSC)\n\n");
+
+    constexpr int N = 1000;
+    uint64_t t0, t1;
+
+    /* config_init_paths */
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        abraxas_paths_t p;
+        config_init_paths(&p);
+    }
+    t1 = bench_ns();
+    bench_print("config_init_paths()", t1 - t0, N);
+
+    /* config_load_location */
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        (void)config_load_location(paths);
+    }
+    t1 = bench_ns();
+    bench_print("config_load_location()", t1 - t0, N);
+
+    /* Load location for solar tests */
+    location_t loc = config_load_location(paths);
+    if (!loc.valid) {
+        loc.lat = 34.26;
+        loc.lon = -88.38;
+    }
+    time_t now = time(nullptr);
+
+    /* solar_sunrise_sunset */
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        volatile sun_times_t st = solar_sunrise_sunset(now, loc.lat, loc.lon);
+        (void)st;
+    }
+    t1 = bench_ns();
+    bench_print("solar_sunrise_sunset()", t1 - t0, N);
+
+    /* solar_position */
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        volatile sun_position_t sp = solar_position(now, loc.lat, loc.lon);
+        (void)sp;
+    }
+    t1 = bench_ns();
+    bench_print("solar_position()", t1 - t0, N);
+
+    /* calculate_solar_temp */
+    sun_times_t st = solar_sunrise_sunset(now, loc.lat, loc.lon);
+    double min_from_sr = st.valid ? difftime(now, st.sunrise) / 60.0 : 0.0;
+    double min_to_ss   = st.valid ? difftime(st.sunset, now)  / 60.0 : 0.0;
+
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        volatile int t = calculate_solar_temp(min_from_sr, min_to_ss, false);
+        (void)t;
+    }
+    t1 = bench_ns();
+    bench_print("calculate_solar_temp()", t1 - t0, N);
+
+    /* sigmoid_norm */
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        volatile double s = sigmoid_norm(0.5, SIGMOID_STEEPNESS);
+        (void)s;
+    }
+    t1 = bench_ns();
+    bench_print("sigmoid_norm()", t1 - t0, N);
+
+    /* JSON parse (override) */
+    override_state_t ovr = config_load_override(paths);
+    (void)ovr;
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        (void)config_load_override(paths);
+    }
+    t1 = bench_ns();
+    bench_print("config_load_override()", t1 - t0, N);
+
+    /* JSON parse (weather cache) */
+    t0 = bench_ns();
+    for (int i = 0; i < N; i++) {
+        (void)config_load_weather_cache(paths);
+    }
+    t1 = bench_ns();
+    bench_print("config_load_weather_cache()", t1 - t0, N);
+
+    printf("\nKernel facilities:\n");
+
+    /* io_uring setup + teardown */
+    {
+        abraxas_ring_t ring;
+        t0 = bench_ns();
+        bool ok = uring_init(&ring, 8);
+        t1 = bench_ns();
+        if (ok) {
+            bench_print("io_uring_setup()", t1 - t0, 1);
+            uring_destroy(&ring);
+        } else {
+            printf("  %-30s unavailable\n", "io_uring_setup()");
+        }
+    }
+
+    /* seccomp (can't actually install in benchmark -- would restrict us) */
+    printf("  %-30s (not measured -- would restrict process)\n", "seccomp_install()");
+    printf("  %-30s (not measured -- would restrict process)\n", "landlock_install()");
+
+    printf("\nDone.\n");
+    return 0;
+}
+
 /* --- Usage --- */
 
 static void usage(void)
@@ -242,6 +392,7 @@ static void usage(void)
     printf("  --set TEMP [MIN]      Override to TEMP (Kelvin) over MIN minutes (default 3)\n");
     printf("  --resume              Clear override, resume solar control\n");
     printf("  --reset               Restore gamma and exit\n");
+    printf("  --benchmark           Nanosecond performance benchmark\n");
     printf("  --help                Show this help\n");
 }
 
@@ -255,6 +406,7 @@ static struct option long_opts[] = {
     { "set",          required_argument, nullptr, 'S' },
     { "resume",       no_argument,       nullptr, 'R' },
     { "reset",        no_argument,       nullptr, 'x' },
+    { "benchmark",    no_argument,       nullptr, 'B' },
     { "help",         no_argument,       nullptr, 'h' },
     { nullptr, 0, nullptr, 0 }
 };
@@ -268,7 +420,7 @@ int main(int argc, char **argv)
     }
 
     enum { CMD_DAEMON, CMD_STATUS, CMD_SET_LOC, CMD_REFRESH,
-           CMD_SET_TEMP, CMD_RESUME, CMD_RESET } command = CMD_DAEMON;
+           CMD_SET_TEMP, CMD_RESUME, CMD_RESET, CMD_BENCHMARK } command = CMD_DAEMON;
     const char *loc_arg = nullptr;
     int set_temp_val = 0;
     int set_temp_dur = 3;
@@ -309,6 +461,7 @@ int main(int argc, char **argv)
         }
         case 'R': command = CMD_RESUME;   break;
         case 'x': command = CMD_RESET;    break;
+        case 'B': command = CMD_BENCHMARK; break;
         case 'h': usage(); return 0;
         default:  usage(); return 1;
         }
@@ -323,6 +476,8 @@ int main(int argc, char **argv)
         return cmd_set_location(loc_arg, &paths);
     if (command == CMD_SET_TEMP)
         return cmd_set_temp(set_temp_val, set_temp_dur, &paths);
+    if (command == CMD_BENCHMARK)
+        return cmd_benchmark(&paths);
 
     /* Remaining commands need location */
     location_t loc = config_load_location(&paths);
@@ -333,7 +488,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    weather_init();
     int result = 0;
     switch (command) {
     case CMD_STATUS:
@@ -358,6 +512,5 @@ int main(int argc, char **argv)
         break;
     }
 
-    weather_cleanup();
     return result;
 }

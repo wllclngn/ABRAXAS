@@ -1281,7 +1281,7 @@ def run_tests(skip_build=False):
 
     print()
     print("=" * 64)
-    print("             ABRAXAS TEST SUITE v4.0.0")
+    print("             ABRAXAS TEST SUITE v5.0.0")
     print("             C23 vs. Rust -- Head to Head")
     print("=" * 64)
 

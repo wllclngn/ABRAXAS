@@ -2,18 +2,76 @@
  * gamma_x11.c - X11 RandR gamma control fallback
  *
  * Used when DRM gamma fails (NVIDIA proprietary, etc.)
- * Requires libX11 and libXrandr at link time.
+ * Libraries loaded at runtime via dlopen -- no link-time dependency.
  */
 
 #ifdef MERIDIAN_HAS_X11
 
+#define _GNU_SOURCE
 #include "meridian.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/Xrandr.h>
+
+/* Runtime-loaded X11 + XRandR functions */
+static struct {
+    void *libx11;
+    void *libxrandr;
+    Display *(*XOpenDisplay)(const char *);
+    int (*XCloseDisplay)(Display *);
+    int (*XFlush)(Display *);
+    XRRScreenResources *(*XRRGetScreenResourcesCurrent)(Display *, Window);
+    void (*XRRFreeScreenResources)(XRRScreenResources *);
+    int (*XRRGetCrtcGammaSize)(Display *, RRCrtc);
+    XRRCrtcGamma *(*XRRGetCrtcGamma)(Display *, RRCrtc);
+    XRRCrtcGamma *(*XRRAllocGamma)(int);
+    void (*XRRSetCrtcGamma)(Display *, RRCrtc, XRRCrtcGamma *);
+    void (*XRRFreeGamma)(XRRCrtcGamma *);
+    bool loaded;
+} x11;
+
+static bool x11_load(void)
+{
+    if (x11.loaded) return true;
+
+    x11.libx11 = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (!x11.libx11) return false;
+
+    x11.libxrandr = dlopen("libXrandr.so.2", RTLD_LAZY | RTLD_LOCAL);
+    if (!x11.libxrandr) { dlclose(x11.libx11); x11.libx11 = nullptr; return false; }
+
+    /* POSIX guarantees dlsym void*->fptr works; suppress ISO C pedantic */
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    #define LOAD(lib, name) \
+        x11.name = dlsym(x11.lib, #name); \
+        if (!x11.name) goto fail
+
+    LOAD(libx11, XOpenDisplay);
+    LOAD(libx11, XCloseDisplay);
+    LOAD(libx11, XFlush);
+    LOAD(libxrandr, XRRGetScreenResourcesCurrent);
+    LOAD(libxrandr, XRRFreeScreenResources);
+    LOAD(libxrandr, XRRGetCrtcGammaSize);
+    LOAD(libxrandr, XRRGetCrtcGamma);
+    LOAD(libxrandr, XRRAllocGamma);
+    LOAD(libxrandr, XRRSetCrtcGamma);
+    LOAD(libxrandr, XRRFreeGamma);
+    #undef LOAD
+    #pragma GCC diagnostic pop
+
+    x11.loaded = true;
+    return true;
+
+fail:
+    dlclose(x11.libxrandr); x11.libxrandr = nullptr;
+    dlclose(x11.libx11);    x11.libx11 = nullptr;
+    return false;
+}
 
 /* X11 state */
 struct meridian_x11_state {
@@ -31,11 +89,13 @@ struct meridian_x11_state {
 meridian_error_t
 meridian_x11_init(meridian_x11_state_t **state_out)
 {
+    if (!x11_load()) return MERIDIAN_ERR_OPEN;
+
     meridian_x11_state_t *state = calloc(1, sizeof(meridian_x11_state_t));
     if (!state) return MERIDIAN_ERR_RESOURCES;
 
     /* Open display */
-    state->display = XOpenDisplay(nullptr);
+    state->display = x11.XOpenDisplay(nullptr);
     if (!state->display) {
         free(state);
         return MERIDIAN_ERR_OPEN;
@@ -45,17 +105,17 @@ meridian_x11_init(meridian_x11_state_t **state_out)
     state->root = RootWindow(state->display, state->screen);
 
     /* Get screen resources */
-    state->resources = XRRGetScreenResourcesCurrent(state->display, state->root);
+    state->resources = x11.XRRGetScreenResourcesCurrent(state->display, state->root);
     if (!state->resources) {
-        XCloseDisplay(state->display);
+        x11.XCloseDisplay(state->display);
         free(state);
         return MERIDIAN_ERR_RESOURCES;
     }
 
     state->crtc_count = state->resources->ncrtc;
     if (state->crtc_count == 0) {
-        XRRFreeScreenResources(state->resources);
-        XCloseDisplay(state->display);
+        x11.XRRFreeScreenResources(state->resources);
+        x11.XCloseDisplay(state->display);
         free(state);
         return MERIDIAN_ERR_NO_CRTC;
     }
@@ -69,8 +129,8 @@ meridian_x11_init(meridian_x11_state_t **state_out)
         free(state->crtcs);
         free(state->gamma_sizes);
         free(state->saved_gamma);
-        XRRFreeScreenResources(state->resources);
-        XCloseDisplay(state->display);
+        x11.XRRFreeScreenResources(state->resources);
+        x11.XCloseDisplay(state->display);
         free(state);
         return MERIDIAN_ERR_RESOURCES;
     }
@@ -78,11 +138,11 @@ meridian_x11_init(meridian_x11_state_t **state_out)
     /* Initialize each CRTC */
     for (int i = 0; i < state->crtc_count; i++) {
         state->crtcs[i] = state->resources->crtcs[i];
-        state->gamma_sizes[i] = XRRGetCrtcGammaSize(state->display, state->crtcs[i]);
+        state->gamma_sizes[i] = x11.XRRGetCrtcGammaSize(state->display, state->crtcs[i]);
 
         /* Save original gamma */
         if (state->gamma_sizes[i] > 0) {
-            state->saved_gamma[i] = XRRGetCrtcGamma(state->display, state->crtcs[i]);
+            state->saved_gamma[i] = x11.XRRGetCrtcGamma(state->display, state->crtcs[i]);
         }
     }
 
@@ -101,7 +161,7 @@ meridian_x11_free(meridian_x11_state_t *state)
     /* Free saved gamma */
     for (int i = 0; i < state->crtc_count; i++) {
         if (state->saved_gamma[i]) {
-            XRRFreeGamma(state->saved_gamma[i]);
+            x11.XRRFreeGamma(state->saved_gamma[i]);
         }
     }
 
@@ -110,11 +170,11 @@ meridian_x11_free(meridian_x11_state_t *state)
     free(state->saved_gamma);
 
     if (state->resources) {
-        XRRFreeScreenResources(state->resources);
+        x11.XRRFreeScreenResources(state->resources);
     }
 
     if (state->display) {
-        XCloseDisplay(state->display);
+        x11.XCloseDisplay(state->display);
     }
 
     free(state);
@@ -149,7 +209,7 @@ meridian_x11_set_temperature_crtc(meridian_x11_state_t *state, int crtc_idx,
     }
 
     /* Allocate XRRCrtcGamma structure */
-    XRRCrtcGamma *gamma = XRRAllocGamma(gamma_size);
+    XRRCrtcGamma *gamma = x11.XRRAllocGamma(gamma_size);
     if (!gamma) {
         return MERIDIAN_ERR_RESOURCES;
     }
@@ -159,15 +219,15 @@ meridian_x11_set_temperature_crtc(meridian_x11_state_t *state, int crtc_idx,
                                                 gamma->red, gamma->green, gamma->blue,
                                                 brightness);
     if (err != MERIDIAN_OK) {
-        XRRFreeGamma(gamma);
+        x11.XRRFreeGamma(gamma);
         return err;
     }
 
     /* Set gamma */
-    XRRSetCrtcGamma(state->display, state->crtcs[crtc_idx], gamma);
-    XFlush(state->display);
+    x11.XRRSetCrtcGamma(state->display, state->crtcs[crtc_idx], gamma);
+    x11.XFlush(state->display);
 
-    XRRFreeGamma(gamma);
+    x11.XRRFreeGamma(gamma);
     return MERIDIAN_OK;
 }
 
@@ -200,10 +260,10 @@ meridian_x11_restore(meridian_x11_state_t *state)
 
     for (int i = 0; i < state->crtc_count; i++) {
         if (state->saved_gamma[i]) {
-            XRRSetCrtcGamma(state->display, state->crtcs[i], state->saved_gamma[i]);
+            x11.XRRSetCrtcGamma(state->display, state->crtcs[i], state->saved_gamma[i]);
         }
     }
-    XFlush(state->display);
+    x11.XFlush(state->display);
 
     return MERIDIAN_OK;
 }

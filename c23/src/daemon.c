@@ -1,8 +1,15 @@
 /*
  * daemon.c - Main daemon event loop
  *
- * Linux kernel interfaces: timerfd (60s tick), inotify (config changes),
- * signalfd (clean shutdown via SIGTERM/SIGINT). All multiplexed with select().
+ * Linux kernel interfaces:
+ *   - io_uring: single-syscall event loop (poll + timeout in one enter call)
+ *   - inotify: config file change detection
+ *   - signalfd: clean shutdown via SIGTERM/SIGINT
+ *   - prctl: timer slack, no_new_privs, dumpable
+ *   - seccomp-bpf: syscall whitelist (post-init)
+ *   - landlock: filesystem sandbox (post-init)
+ *
+ * Falls back to select() + timerfd if io_uring_setup fails.
  * Gamma control via libmeridian (statically linked).
  */
 
@@ -10,8 +17,11 @@
 
 #include "daemon.h"
 #include "config.h"
+#include "landlock.h"
+#include "seccomp.h"
 #include "sigmoid.h"
 #include "solar.h"
+#include "uring.h"
 #include "weather.h"
 
 #include <meridian.h>
@@ -22,13 +32,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/prctl.h>
 #include <sys/select.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
-/* --- Gamma control (libmeridian direct calls, no ctypes) --- */
+/* io_uring user_data tags */
+constexpr uint64_t EV_INOTIFY = 1;
+constexpr uint64_t EV_SIGNAL  = 2;
+constexpr uint64_t EV_TIMEOUT = 3;
+constexpr uint64_t EV_CANCEL  = 4;
+
+/* --- Gamma control (libmeridian direct calls) --- */
 
 static meridian_state_t *gamma_state = nullptr;
 
@@ -134,165 +151,105 @@ static int solar_temperature(time_t now, double lat, double lon,
     return calculate_solar_temp(minutes_from_sunrise, minutes_to_sunset, is_dark);
 }
 
-/* --- Main event loop --- */
+/* --- Inotify event processing (shared by both event loops) --- */
 
-void daemon_run(daemon_state_t *state)
+static void process_inotify(int inotify_fd, const daemon_state_t *state,
+                            bool *config_changed, bool *override_changed)
 {
-    fprintf(stderr, "Starting abraxas daemon\n");
-    fprintf(stderr, "Location: %.4f, %.4f\n", state->location.lat, state->location.lon);
-    fprintf(stderr, "Weather refresh: every %d min\n", WEATHER_REFRESH_SEC / 60);
-    fprintf(stderr, "Temperature update: every %ds\n", TEMP_UPDATE_SEC);
-    fprintf(stderr, "Using kernel timerfd + inotify + signalfd\n\n");
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    ssize_t len = read(inotify_fd, buf, sizeof(buf));
+    if (len <= 0) return;
 
-    /* Retry gamma init -- display server may not be ready at boot.
-     * Poll every 500ms for up to 30s to catch X11/Wayland readiness fast. */
-    constexpr int  GAMMA_INIT_MAX_RETRIES = 60;
-    constexpr long GAMMA_INIT_RETRY_NS    = 500000000L; /* 500ms */
-    for (int attempt = 0; attempt < GAMMA_INIT_MAX_RETRIES; attempt++) {
-        if (gamma_init()) break;
-        if (attempt == GAMMA_INIT_MAX_RETRIES - 1) {
-            fprintf(stderr, "[fatal] No gamma backend after 30s\n");
-            exit(1);
-        }
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = GAMMA_INIT_RETRY_NS };
-        nanosleep(&ts, nullptr);
-    }
+    for (char *ptr = buf; ptr < buf + len; ) {
+        struct inotify_event *event = (struct inotify_event *)ptr;
+        if (event->len > 0) {
+            const char *override_name = strrchr(state->paths.override_file, '/');
+            override_name = override_name ? override_name + 1 : state->paths.override_file;
 
-    /* Write PID file */
-    config_write_pid(&state->paths);
+            const char *config_name = strrchr(state->paths.config_file, '/');
+            config_name = config_name ? config_name + 1 : state->paths.config_file;
 
-    /* Load cached data */
-    state->weather = config_load_weather_cache(&state->paths);
-
-    /* Apply correct temperature immediately at startup */
-    int startup_temp = solar_temperature(time(nullptr),
-        state->location.lat, state->location.lon, &state->weather);
-    gamma_set(startup_temp);
-    fprintf(stderr, "[startup] Applied %dK\n", startup_temp);
-
-    /* Init weather subsystem (curl) -- after gamma is applied, before event loop */
-    weather_init();
-
-    bool running = true;
-
-    /* Create kernel fds */
-    int timer_fd = create_timerfd(TEMP_UPDATE_SEC);
-    if (timer_fd >= 0)
-        fprintf(stderr, "[kernel] timerfd created (fd=%d)\n", timer_fd);
-    else
-        fprintf(stderr, "[warn] timerfd failed, falling back to sleep()\n");
-
-    int inotify_fd = create_inotify_watch(state->paths.config_dir);
-    if (inotify_fd >= 0)
-        fprintf(stderr, "[kernel] inotify watching %s (fd=%d)\n", state->paths.config_dir, inotify_fd);
-    else
-        fprintf(stderr, "[warn] inotify failed, config changes require restart\n");
-
-    int signal_fd = create_signalfd_masked();
-    if (signal_fd >= 0)
-        fprintf(stderr, "[kernel] signalfd created (fd=%d)\n", signal_fd);
-    else
-        fprintf(stderr, "[warn] signalfd failed\n");
-
-    /* Recover from active override on restart */
-    override_state_t ovr = config_load_override(&state->paths);
-    if (ovr.active) {
-        double elapsed = difftime(time(nullptr), ovr.issued_at) / 60.0;
-        if (elapsed >= (double)ovr.duration_minutes) {
-            /* Override already completed before restart -- discard it */
-            config_clear_override(&state->paths);
-            fprintf(stderr, "[manual] Cleared stale override (completed %.0f min ago)\n",
-                   elapsed - (double)ovr.duration_minutes);
-        } else {
-            state->manual_mode = true;
-            state->manual_target_temp = ovr.target_temp;
-            state->manual_duration_min = ovr.duration_minutes;
-            state->manual_issued_at = ovr.issued_at;
-            state->manual_start_time = ovr.issued_at;
-            state->manual_start_temp = ovr.start_temp;
-            if (state->manual_start_temp == 0) {
-                state->manual_start_temp = solar_temperature(time(nullptr),
-                    state->location.lat, state->location.lon, &state->weather);
-                ovr.start_temp = state->manual_start_temp;
-                config_save_override(&state->paths, &ovr);
+            if (strcmp(event->name, override_name) == 0)
+                *override_changed = true;
+            if (strcmp(event->name, config_name) == 0) {
+                *config_changed = true;
+                fprintf(stderr, "[inotify] %s changed, reloading...\n", event->name);
             }
-            state->manual_resume_time = next_transition_resume(time(nullptr),
-                state->location.lat, state->location.lon);
-            fprintf(stderr, "[manual] Recovered override: -> %dK (%d min)\n",
-                   state->manual_target_temp, state->manual_duration_min);
-
-            struct tm rt;
-            localtime_r(&state->manual_resume_time, &rt);
-            fprintf(stderr, "[manual] Auto-resume at: %02d:%02d\n", rt.tm_hour, rt.tm_min);
         }
+        ptr += sizeof(struct inotify_event) + event->len;
     }
+}
 
-    /* Event loop */
-    while (running) {
-        /* Build fd_set */
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        int maxfd = -1;
+/* --- io_uring event loop --- */
 
-        if (timer_fd >= 0)   { FD_SET(timer_fd, &readfds);   if (timer_fd > maxfd) maxfd = timer_fd; }
-        if (inotify_fd >= 0) { FD_SET(inotify_fd, &readfds); if (inotify_fd > maxfd) maxfd = inotify_fd; }
-        if (signal_fd >= 0)  { FD_SET(signal_fd, &readfds);  if (signal_fd > maxfd) maxfd = signal_fd; }
+static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
+                             int inotify_fd, int signal_fd)
+{
+    struct __kernel_timespec ts = {
+        .tv_sec  = TEMP_UPDATE_SEC,
+        .tv_nsec = 0
+    };
 
-        struct timeval timeout = { .tv_sec = TEMP_UPDATE_SEC, .tv_usec = 0 };
-        struct timeval *tv = (timer_fd >= 0) ? nullptr : &timeout;
+    while (1) {
+        /* Submit: poll both fds + timeout */
+        if (inotify_fd >= 0)
+            uring_prep_poll(ring, inotify_fd, EV_INOTIFY);
+        if (signal_fd >= 0)
+            uring_prep_poll(ring, signal_fd, EV_SIGNAL);
+        uring_prep_timeout(ring, &ts, EV_TIMEOUT);
 
-        int ready = select(maxfd + 1, &readfds, nullptr, nullptr, tv);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
+        int ret = uring_submit_and_wait(ring);
+        if (ret < 0 && errno != EINTR) break;
 
+        /* Process completions */
+        bool timer_expired = false;
+        bool got_signal = false;
         bool config_changed = false;
         bool override_changed = false;
 
-        /* Process events */
-        if (timer_fd >= 0 && FD_ISSET(timer_fd, &readfds)) {
-            uint64_t exp;
-            (void)read(timer_fd, &exp, sizeof(exp));
+        struct io_uring_cqe *cqe;
+        while (uring_peek_cqe(ring, &cqe)) {
+            switch (cqe->user_data) {
+            case EV_TIMEOUT:
+                timer_expired = true;
+                break;
+            case EV_SIGNAL:
+                got_signal = true;
+                break;
+            case EV_INOTIFY:
+                if (cqe->res > 0)
+                    process_inotify(inotify_fd, state,
+                                    &config_changed, &override_changed);
+                break;
+            case EV_CANCEL:
+                break;
+            }
+            uring_cqe_seen(ring);
         }
 
-        if (signal_fd >= 0 && FD_ISSET(signal_fd, &readfds)) {
-            struct signalfd_siginfo si;
-            (void)read(signal_fd, &si, sizeof(si));
+        /* If we woke early (inotify/signal), cancel the pending timeout */
+        if (!timer_expired) {
+            uring_prep_cancel(ring, EV_TIMEOUT, EV_CANCEL);
+            uring_submit_and_wait(ring);
+            /* Drain cancel completion */
+            while (uring_peek_cqe(ring, &cqe))
+                uring_cqe_seen(ring);
+        }
+
+        if (got_signal) {
+            /* Drain signalfd so it doesn't refire */
+            if (signal_fd >= 0) {
+                struct signalfd_siginfo si;
+                (void)read(signal_fd, &si, sizeof(si));
+            }
             fprintf(stderr, "\nReceived shutdown signal...\n");
-            running = false;
             break;
         }
 
-        if (inotify_fd >= 0 && FD_ISSET(inotify_fd, &readfds)) {
-            char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-            ssize_t len = read(inotify_fd, buf, sizeof(buf));
-            if (len <= 0) goto skip_inotify;
-
-            for (char *ptr = buf; ptr < buf + len; ) {
-                struct inotify_event *event = (struct inotify_event *)ptr;
-                if (event->len > 0) {
-                    const char *override_name = strrchr(state->paths.override_file, '/');
-                    override_name = override_name ? override_name + 1 : state->paths.override_file;
-
-                    const char *config_name = strrchr(state->paths.config_file, '/');
-                    config_name = config_name ? config_name + 1 : state->paths.config_file;
-
-                    if (strcmp(event->name, override_name) == 0)
-                        override_changed = true;
-                    if (strcmp(event->name, config_name) == 0) {
-                        config_changed = true;
-                        fprintf(stderr, "[inotify] %s changed, reloading...\n", event->name);
-                    }
-                }
-                ptr += sizeof(struct inotify_event) + event->len;
-            }
-        skip_inotify:;
-        }
+        /* --- Common tick processing --- */
 
         time_t now = time(nullptr);
 
-        /* Reload config if changed */
         if (config_changed) {
             location_t new_loc = config_load_location(&state->paths);
             if (new_loc.valid) {
@@ -303,12 +260,10 @@ void daemon_run(daemon_state_t *state)
             state->weather = config_load_weather_cache(&state->paths);
         }
 
-        /* Process override changes */
         if (override_changed) {
             override_state_t od = config_load_override(&state->paths);
 
             if (od.active && od.issued_at != state->manual_issued_at) {
-                /* New override command from CLI */
                 state->manual_mode = true;
                 state->manual_issued_at = od.issued_at;
                 state->manual_target_temp = od.target_temp;
@@ -338,7 +293,6 @@ void daemon_run(daemon_state_t *state)
                 fprintf(stderr, "[manual] Auto-resume at: %02d:%02d\n", rt.tm_hour, rt.tm_min);
 
             } else if (!od.active && state->manual_mode) {
-                /* Resume command from CLI */
                 state->manual_mode = false;
                 state->manual_issued_at = 0;
                 config_clear_override(&state->paths);
@@ -347,7 +301,6 @@ void daemon_run(daemon_state_t *state)
         }
 
 #ifndef NOAA_DISABLED
-        /* Refresh weather if needed */
         if (config_weather_needs_refresh(&state->weather)) {
             struct tm nt;
             localtime_r(&now, &nt);
@@ -364,13 +317,11 @@ void daemon_run(daemon_state_t *state)
         }
 #endif
 
-        /* Calculate temperature */
         int temp;
         if (state->manual_mode) {
             temp = calculate_manual_temp(state->manual_start_temp, state->manual_target_temp,
                                          state->manual_start_time, state->manual_duration_min, now);
 
-            /* Check auto-resume (only after transition is complete) */
             double elapsed = difftime(now, state->manual_start_time) / 60.0;
             if (elapsed >= (double)state->manual_duration_min &&
                 state->manual_resume_time > 0 && now >= state->manual_resume_time) {
@@ -386,7 +337,6 @@ void daemon_run(daemon_state_t *state)
                                      &state->weather);
         }
 
-        /* Apply temperature if changed */
         if (!state->last_temp_valid || temp != state->last_temp) {
             struct tm nt;
             localtime_r(&now, &nt);
@@ -414,6 +364,290 @@ void daemon_run(daemon_state_t *state)
             state->last_temp_valid = true;
         }
     }
+}
+
+/* --- select() event loop (fallback) --- */
+
+static void event_loop_select(daemon_state_t *state,
+                              int timer_fd, int inotify_fd, int signal_fd)
+{
+    while (1) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        int maxfd = -1;
+
+        if (timer_fd >= 0)   { FD_SET(timer_fd, &readfds);   if (timer_fd > maxfd) maxfd = timer_fd; }
+        if (inotify_fd >= 0) { FD_SET(inotify_fd, &readfds); if (inotify_fd > maxfd) maxfd = inotify_fd; }
+        if (signal_fd >= 0)  { FD_SET(signal_fd, &readfds);  if (signal_fd > maxfd) maxfd = signal_fd; }
+
+        struct timeval timeout = { .tv_sec = TEMP_UPDATE_SEC, .tv_usec = 0 };
+        struct timeval *tv = (timer_fd >= 0) ? nullptr : &timeout;
+
+        int ready = select(maxfd + 1, &readfds, nullptr, nullptr, tv);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        bool config_changed = false;
+        bool override_changed = false;
+
+        if (timer_fd >= 0 && FD_ISSET(timer_fd, &readfds)) {
+            uint64_t exp;
+            (void)read(timer_fd, &exp, sizeof(exp));
+        }
+
+        if (signal_fd >= 0 && FD_ISSET(signal_fd, &readfds)) {
+            struct signalfd_siginfo si;
+            (void)read(signal_fd, &si, sizeof(si));
+            fprintf(stderr, "\nReceived shutdown signal...\n");
+            break;
+        }
+
+        if (inotify_fd >= 0 && FD_ISSET(inotify_fd, &readfds))
+            process_inotify(inotify_fd, state, &config_changed, &override_changed);
+
+        time_t now = time(nullptr);
+
+        if (config_changed) {
+            location_t new_loc = config_load_location(&state->paths);
+            if (new_loc.valid) {
+                state->location = new_loc;
+                fprintf(stderr, "[config] Location updated: %.4f, %.4f\n",
+                       state->location.lat, state->location.lon);
+            }
+            state->weather = config_load_weather_cache(&state->paths);
+        }
+
+        if (override_changed) {
+            override_state_t od = config_load_override(&state->paths);
+
+            if (od.active && od.issued_at != state->manual_issued_at) {
+                state->manual_mode = true;
+                state->manual_issued_at = od.issued_at;
+                state->manual_target_temp = od.target_temp;
+                state->manual_duration_min = od.duration_minutes;
+                state->manual_start_time = od.issued_at;
+                state->manual_start_temp = state->last_temp_valid
+                    ? state->last_temp
+                    : solar_temperature(now, state->location.lat, state->location.lon, &state->weather);
+
+                if (od.start_temp == 0) {
+                    od.start_temp = state->manual_start_temp;
+                    config_save_override(&state->paths, &od);
+                }
+
+                state->manual_resume_time = next_transition_resume(now,
+                    state->location.lat, state->location.lon);
+
+                if (state->manual_duration_min > 0)
+                    fprintf(stderr, "[manual] Override: %dK -> %dK over %d min\n",
+                           state->manual_start_temp, state->manual_target_temp,
+                           state->manual_duration_min);
+                else
+                    fprintf(stderr, "[manual] Override: -> %dK (instant)\n", state->manual_target_temp);
+
+                struct tm rt;
+                localtime_r(&state->manual_resume_time, &rt);
+                fprintf(stderr, "[manual] Auto-resume at: %02d:%02d\n", rt.tm_hour, rt.tm_min);
+
+            } else if (!od.active && state->manual_mode) {
+                state->manual_mode = false;
+                state->manual_issued_at = 0;
+                config_clear_override(&state->paths);
+                fprintf(stderr, "[manual] Override cleared, resuming solar control\n");
+            }
+        }
+
+#ifndef NOAA_DISABLED
+        if (config_weather_needs_refresh(&state->weather)) {
+            struct tm nt;
+            localtime_r(&now, &nt);
+            fprintf(stderr, "[%02d:%02d:%02d] Refreshing weather...\n", nt.tm_hour, nt.tm_min, nt.tm_sec);
+
+            state->weather = weather_fetch(state->location.lat, state->location.lon);
+            config_save_weather_cache(&state->paths, &state->weather);
+
+            if (!state->weather.has_error)
+                fprintf(stderr, "  Weather: %s (%d%% clouds)\n",
+                       state->weather.forecast, state->weather.cloud_cover);
+            else
+                fprintf(stderr, "  Weather fetch failed\n");
+        }
+#endif
+
+        int temp;
+        if (state->manual_mode) {
+            temp = calculate_manual_temp(state->manual_start_temp, state->manual_target_temp,
+                                         state->manual_start_time, state->manual_duration_min, now);
+
+            double elapsed = difftime(now, state->manual_start_time) / 60.0;
+            if (elapsed >= (double)state->manual_duration_min &&
+                state->manual_resume_time > 0 && now >= state->manual_resume_time) {
+                state->manual_mode = false;
+                state->manual_issued_at = 0;
+                config_clear_override(&state->paths);
+                fprintf(stderr, "[manual] Auto-resuming solar control (transition window approaching)\n");
+                temp = solar_temperature(now, state->location.lat, state->location.lon,
+                                         &state->weather);
+            }
+        } else {
+            temp = solar_temperature(now, state->location.lat, state->location.lon,
+                                     &state->weather);
+        }
+
+        if (!state->last_temp_valid || temp != state->last_temp) {
+            struct tm nt;
+            localtime_r(&now, &nt);
+
+            if (state->manual_mode) {
+                double elapsed = difftime(now, state->manual_start_time) / 60.0;
+                if (elapsed < (double)state->manual_duration_min) {
+                    int pct = (int)(elapsed / (double)state->manual_duration_min * 100.0);
+                    if (pct > 100) pct = 100;
+                    fprintf(stderr, "[%02d:%02d:%02d] Manual: %dK (%d%%)\n",
+                           nt.tm_hour, nt.tm_min, nt.tm_sec, temp, pct);
+                } else {
+                    fprintf(stderr, "[%02d:%02d:%02d] Manual: %dK (holding)\n",
+                           nt.tm_hour, nt.tm_min, nt.tm_sec, temp);
+                }
+            } else {
+                sun_position_t sp = solar_position(now, state->location.lat, state->location.lon);
+                fprintf(stderr, "[%02d:%02d:%02d] Solar: %dK (sun: %.1f, clouds: %d%%)\n",
+                       nt.tm_hour, nt.tm_min, nt.tm_sec, temp, sp.elevation,
+                       state->weather.cloud_cover);
+            }
+
+            gamma_set(temp);
+            state->last_temp = temp;
+            state->last_temp_valid = true;
+        }
+    }
+}
+
+/* --- Main entry point --- */
+
+void daemon_run(daemon_state_t *state)
+{
+    fprintf(stderr, "Starting abraxas daemon\n");
+    fprintf(stderr, "Location: %.4f, %.4f\n", state->location.lat, state->location.lon);
+    fprintf(stderr, "Weather refresh: every %d min\n", WEATHER_REFRESH_SEC / 60);
+    fprintf(stderr, "Temperature update: every %ds\n", TEMP_UPDATE_SEC);
+
+    /* Retry gamma init -- display server may not be ready at boot.
+     * Poll every 500ms for up to 30s to catch X11/Wayland readiness fast. */
+    constexpr int  GAMMA_INIT_MAX_RETRIES = 60;
+    constexpr long GAMMA_INIT_RETRY_NS    = 500000000L; /* 500ms */
+    for (int attempt = 0; attempt < GAMMA_INIT_MAX_RETRIES; attempt++) {
+        if (gamma_init()) break;
+        if (attempt == GAMMA_INIT_MAX_RETRIES - 1) {
+            fprintf(stderr, "[fatal] No gamma backend after 30s\n");
+            exit(1);
+        }
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = GAMMA_INIT_RETRY_NS };
+        nanosleep(&ts, nullptr);
+    }
+
+    /* Write PID file */
+    config_write_pid(&state->paths);
+
+    /* Load cached data */
+    state->weather = config_load_weather_cache(&state->paths);
+
+    /* Apply correct temperature immediately at startup */
+    int startup_temp = solar_temperature(time(nullptr),
+        state->location.lat, state->location.lon, &state->weather);
+    gamma_set(startup_temp);
+    fprintf(stderr, "[startup] Applied %dK\n", startup_temp);
+
+    /* Init weather subsystem */
+    weather_init();
+
+    /* Create kernel fds */
+    int inotify_fd = create_inotify_watch(state->paths.config_dir);
+    if (inotify_fd >= 0)
+        fprintf(stderr, "[kernel] inotify watching %s (fd=%d)\n", state->paths.config_dir, inotify_fd);
+    else
+        fprintf(stderr, "[warn] inotify failed, config changes require restart\n");
+
+    int signal_fd = create_signalfd_masked();
+    if (signal_fd >= 0)
+        fprintf(stderr, "[kernel] signalfd created (fd=%d)\n", signal_fd);
+    else
+        fprintf(stderr, "[warn] signalfd failed\n");
+
+    /* prctl hardening */
+    prctl(PR_SET_TIMERSLACK, 1);         /* 1ns timer precision (default 50us) */
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    prctl(PR_SET_DUMPABLE, 0);
+    fprintf(stderr, "[kernel] prctl: timerslack=1ns, no_new_privs, !dumpable\n");
+
+    /* Landlock filesystem sandbox */
+    if (landlock_install_sandbox(state->paths.config_dir))
+        fprintf(stderr, "[kernel] landlock: filesystem sandbox active\n");
+    else
+        fprintf(stderr, "[kernel] landlock: unavailable (kernel too old or disabled)\n");
+
+    /* seccomp-bpf syscall whitelist */
+    if (seccomp_install_filter())
+        fprintf(stderr, "[kernel] seccomp: syscall whitelist active\n");
+    else
+        fprintf(stderr, "[kernel] seccomp: filter install failed\n");
+
+    /* Recover from active override on restart */
+    override_state_t ovr = config_load_override(&state->paths);
+    if (ovr.active) {
+        double elapsed = difftime(time(nullptr), ovr.issued_at) / 60.0;
+        if (elapsed >= (double)ovr.duration_minutes) {
+            config_clear_override(&state->paths);
+            fprintf(stderr, "[manual] Cleared stale override (completed %.0f min ago)\n",
+                   elapsed - (double)ovr.duration_minutes);
+        } else {
+            state->manual_mode = true;
+            state->manual_target_temp = ovr.target_temp;
+            state->manual_duration_min = ovr.duration_minutes;
+            state->manual_issued_at = ovr.issued_at;
+            state->manual_start_time = ovr.issued_at;
+            state->manual_start_temp = ovr.start_temp;
+            if (state->manual_start_temp == 0) {
+                state->manual_start_temp = solar_temperature(time(nullptr),
+                    state->location.lat, state->location.lon, &state->weather);
+                ovr.start_temp = state->manual_start_temp;
+                config_save_override(&state->paths, &ovr);
+            }
+            state->manual_resume_time = next_transition_resume(time(nullptr),
+                state->location.lat, state->location.lon);
+            fprintf(stderr, "[manual] Recovered override: -> %dK (%d min)\n",
+                   state->manual_target_temp, state->manual_duration_min);
+
+            struct tm rt;
+            localtime_r(&state->manual_resume_time, &rt);
+            fprintf(stderr, "[manual] Auto-resume at: %02d:%02d\n", rt.tm_hour, rt.tm_min);
+        }
+    }
+
+    /* Try io_uring first, fall back to select() + timerfd */
+    abraxas_ring_t ring;
+    bool use_uring = uring_init(&ring, 8);
+
+    if (use_uring) {
+        fprintf(stderr, "[kernel] io_uring initialized (1 syscall/tick)\n\n");
+        event_loop_uring(state, &ring, inotify_fd, signal_fd);
+        uring_destroy(&ring);
+    } else {
+        fprintf(stderr, "[kernel] io_uring unavailable, using select() fallback\n");
+
+        int timer_fd = create_timerfd(TEMP_UPDATE_SEC);
+        if (timer_fd >= 0)
+            fprintf(stderr, "[kernel] timerfd created (fd=%d)\n", timer_fd);
+        else
+            fprintf(stderr, "[warn] timerfd failed, falling back to sleep()\n");
+        fprintf(stderr, "\n");
+
+        event_loop_select(state, timer_fd, inotify_fd, signal_fd);
+
+        if (timer_fd >= 0) close(timer_fd);
+    }
 
     /* Clean shutdown */
     fprintf(stderr, "Shutting down...\n");
@@ -422,7 +656,6 @@ void daemon_run(daemon_state_t *state)
     gamma_cleanup();
     config_remove_pid(&state->paths);
 
-    if (timer_fd >= 0)   close(timer_fd);
     if (inotify_fd >= 0) close(inotify_fd);
     if (signal_fd >= 0)  close(signal_fd);
 }
