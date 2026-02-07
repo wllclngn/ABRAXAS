@@ -27,6 +27,7 @@
 #include <meridian.h>
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <stdio.h>
@@ -191,7 +192,7 @@ static void event_loop_uring(daemon_state_t *state, abraxas_ring_t *ring,
         /* Process completions */
         bool timer_expired = false;
         bool got_signal = false;
-        bool weather_ready = false;
+        _Atomic bool weather_ready = false;
         bool config_changed = false;
         bool override_changed = false;
 

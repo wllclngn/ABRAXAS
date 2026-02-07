@@ -61,6 +61,7 @@ bool seccomp_install_filter(void)
         ALLOW_SYSCALL(__NR_mprotect),
         ALLOW_SYSCALL(__NR_brk),
         ALLOW_SYSCALL(__NR_mremap),
+        ALLOW_SYSCALL(__NR_madvise),
 
         /* --- Whitelist: io_uring --- */
         ALLOW_SYSCALL(__NR_io_uring_setup),
@@ -132,16 +133,29 @@ bool seccomp_install_filter(void)
         /* --- Whitelist: socket I/O (X11/Wayland backend, curl child) --- */
         ALLOW_SYSCALL(__NR_socket),
         ALLOW_SYSCALL(__NR_connect),
+        ALLOW_SYSCALL(__NR_bind),
+        ALLOW_SYSCALL(__NR_setsockopt),
+        ALLOW_SYSCALL(__NR_getsockopt),
+        ALLOW_SYSCALL(__NR_shutdown),
         ALLOW_SYSCALL(__NR_sendto),
         ALLOW_SYSCALL(__NR_sendmsg),
+        ALLOW_SYSCALL(__NR_sendmmsg),
         ALLOW_SYSCALL(__NR_recvfrom),
         ALLOW_SYSCALL(__NR_recvmsg),
+        ALLOW_SYSCALL(__NR_recvmmsg),
         ALLOW_SYSCALL(__NR_getpeername),
         ALLOW_SYSCALL(__NR_getsockname),
         ALLOW_SYSCALL(__NR_poll),
         ALLOW_SYSCALL(__NR_ppoll),
         ALLOW_SYSCALL(__NR_writev),
         ALLOW_SYSCALL(__NR_uname),
+
+        /* --- Whitelist: epoll + eventfd (curl child process) --- */
+        ALLOW_SYSCALL(__NR_epoll_create1),
+        ALLOW_SYSCALL(__NR_epoll_ctl),
+        ALLOW_SYSCALL(__NR_epoll_wait),
+        ALLOW_SYSCALL(__NR_epoll_pwait),
+        ALLOW_SYSCALL(__NR_eventfd2),
 
         /* --- Whitelist: dlopen (backend loading) --- */
         ALLOW_SYSCALL(__NR_getdents64),

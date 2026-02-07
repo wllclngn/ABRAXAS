@@ -14,6 +14,7 @@ use crate::gamma;
 use crate::uring::{self, AbraxasRing, KernelTimespec};
 
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const GAMMA_INIT_MAX_RETRIES: i32 = 60;
 const GAMMA_INIT_RETRY_MS: u64 = 500;
@@ -214,7 +215,7 @@ fn event_loop_uring(
         // Process completions
         let mut timer_expired = false;
         let mut got_signal = false;
-        let mut weather_ready = false;
+        let weather_ready = AtomicBool::new(false);
         let mut event = EventResult::default();
 
         while let Some(cqe) = ring.peek_cqe() {
@@ -227,7 +228,7 @@ fn event_loop_uring(
                     }
                 }
                 uring::EV_WEATHER => {
-                    if cqe.res > 0 { weather_ready = true; }
+                    if cqe.res > 0 { weather_ready.store(true, Ordering::Relaxed); }
                 }
                 uring::EV_CANCEL => {}
                 _ => {}
@@ -281,7 +282,7 @@ fn event_loop_uring(
                 }
             }
 
-            if weather_ready {
+            if weather_ready.load(Ordering::Relaxed) {
                 match wfs.read_response() {
                     ReadResult::Pending => {}
                     ReadResult::NewPipe => {}

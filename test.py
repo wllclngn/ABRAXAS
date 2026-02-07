@@ -1565,6 +1565,76 @@ def test_edge_cases(R):
 
 
 # =============================================================================
+# NOAA WEATHER API (live fetch -- NYC)
+# =============================================================================
+
+# New York City -- known NOAA coverage, reliable grid point
+NYC_LAT = 40.7128
+NYC_LON = -74.0060
+
+def test_weather_api(R):
+    """Live NOAA weather fetch via --refresh for both C23 and Rust.
+
+    Uses NYC coordinates. Requires network access and curl(1).
+    Tests that the seccomp filter allows curl child processes to complete.
+    """
+    R.section("NOAA WEATHER API (NYC)")
+
+    for name, binary in [("C23", C23_BIN), ("Rust", RUST_BIN)]:
+        if not binary.exists():
+            R.skip(f"{name} weather", "binary not built")
+            continue
+
+        test_home, config_dir, env = make_test_env()
+        try:
+            loc_str = f"{NYC_LAT},{NYC_LON}"
+            run_cmd([str(binary), "--set-location", loc_str], env=env)
+
+            ret, out, err = run_cmd(
+                [str(binary), "--refresh"], env=env, timeout=15
+            )
+            text = out + err
+
+            if ret == 0 and "Weather:" in text:
+                # Extract forecast line
+                for line in text.splitlines():
+                    if line.startswith("Weather:"):
+                        forecast = line.split(":", 1)[1].strip()
+                        R.ok(f"{name}: NOAA fetch OK -- \"{forecast}\"")
+                        break
+                else:
+                    R.ok(f"{name}: NOAA fetch OK (exit=0)")
+
+                # Check cloud cover was parsed
+                if "Cloud cover:" in text:
+                    for line in text.splitlines():
+                        if "Cloud cover:" in line:
+                            R.ok(f"{name}: {line.strip()}")
+                            break
+            elif ret != 0:
+                R.fail(f"{name}: --refresh failed (exit={ret})",
+                       text[:300])
+            else:
+                R.fail(f"{name}: --refresh missing Weather: line",
+                       text[:300])
+
+            # Verify weather cache was written
+            cache_file = os.path.join(config_dir, "weather_cache.json")
+            if os.path.exists(cache_file):
+                data = json.loads(open(cache_file).read())
+                if data.get("forecast") and not data.get("has_error"):
+                    R.ok(f"{name}: weather cache saved ({data['forecast']})")
+                else:
+                    R.fail(f"{name}: weather cache has error flag",
+                           str(data)[:200])
+            else:
+                R.fail(f"{name}: weather.json not written")
+
+        finally:
+            cleanup_test_env(test_home)
+
+
+# =============================================================================
 # PERFORMANCE COMPARISON
 # =============================================================================
 
@@ -1802,7 +1872,7 @@ def run_tests(skip_build=False):
 
     print()
     print("=" * 64)
-    print("             ABRAXAS TEST SUITE v8.1.0")
+    print("             ABRAXAS TEST SUITE v8.2.0")
     print("         C23 vs. Rust vs. Rust-musl -- Head to Head")
     print("=" * 64)
 
@@ -1843,6 +1913,9 @@ def run_tests(skip_build=False):
     test_daemon_rapid_overrides(R)
     test_sigterm_responsiveness(R)
     test_sigterm_during_gamma_retry(R)
+
+    # NOAA weather API (live)
+    test_weather_api(R)
 
     # Performance
     test_performance(R)

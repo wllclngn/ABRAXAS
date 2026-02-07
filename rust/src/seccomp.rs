@@ -79,8 +79,14 @@ mod nr {
     pub const RECVFROM: u32 = 45;
     pub const SENDMSG: u32 = 46;
     pub const RECVMSG: u32 = 47;
+    pub const RECVMMSG: u32 = 299;
+    pub const SENDMMSG: u32 = 307;
+    pub const SHUTDOWN: u32 = 48;
+    pub const BIND: u32 = 49;
     pub const GETSOCKNAME: u32 = 51;
     pub const GETPEERNAME: u32 = 52;
+    pub const SETSOCKOPT: u32 = 54;
+    pub const GETSOCKOPT: u32 = 55;
     pub const CLONE: u32 = 56;
     pub const EXECVE: u32 = 59;
     pub const EXIT: u32 = 60;
@@ -115,7 +121,12 @@ mod nr {
     pub const READLINKAT: u32 = 267;
     pub const PPOLL: u32 = 271;
     pub const SET_ROBUST_LIST: u32 = 273;
+    pub const EPOLL_WAIT: u32 = 232;
+    pub const EPOLL_CTL: u32 = 233;
     pub const SIGNALFD4: u32 = 289;
+    pub const EVENTFD2: u32 = 290;
+    pub const EPOLL_CREATE1: u32 = 291;
+    pub const EPOLL_PWAIT: u32 = 281;
     pub const DUP3: u32 = 292;
     pub const PIPE2: u32 = 293;
     pub const INOTIFY_INIT1: u32 = 294;
@@ -294,13 +305,25 @@ pub fn install_filter() -> bool {
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::CONNECT, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::BIND, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::SETSOCKOPT, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::GETSOCKOPT, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::SHUTDOWN, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::SENDTO, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::SENDMSG, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::SENDMMSG, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::RECVFROM, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::RECVMSG, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::RECVMMSG, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::GETPEERNAME, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
@@ -313,6 +336,18 @@ pub fn install_filter() -> bool {
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::WRITEV, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::UNAME, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+        // --- epoll + eventfd (curl child process) ---
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::EPOLL_CREATE1, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::EPOLL_CTL, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::EPOLL_WAIT, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::EPOLL_PWAIT, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr::EVENTFD2, 0, 1),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 
         // --- dlopen (backend loading) ---
